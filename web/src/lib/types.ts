@@ -54,6 +54,7 @@ export interface SessionState {
   duration: number | null;
   source?: string;
   recordingUrl?: string | null;
+  recordingPath?: string;
   captions?: CaptionsState;
 }
 
@@ -66,4 +67,49 @@ export interface EditPlanSpec {
   ticks_hz?: number;
   captions_vtt_path?: string;
   segments: Segment[];
+  intro_trim?: IntroTrimDecision;
 }
+
+// Wood Wide learned intro trim types
+export interface EarlyFeatures {
+  early_shaky_ratio: number;
+  early_avg_confidence: number;
+  early_num_flips: number;
+  early_face_ratio?: number;
+  early_audio_energy?: number;
+  user_id?: string;
+  device_type?: string;
+}
+
+export interface IntroTrimPrediction {
+  intro_trim_seconds: number;
+  dataset_id: string;
+  model_id: string;
+  raw_prediction: number;
+}
+
+export interface IntroTrimDecision {
+  type: "TRIM_INTRO";
+  trim_seconds: number;
+  display_seconds: number; // Rounded to nearest 0.5s
+  prediction: IntroTrimPrediction;
+}
+
+// Tool adapter types
+export type CapabilityName =
+  | "trim_intro"
+  | "stabilize_segment"
+  | "cut_segment"
+  | "bridge_segments"
+  | "generate_captions"
+  | "export_video";
+
+export interface ToolResult<T = unknown> {
+  success: boolean;
+  data?: T;
+  error?: string;
+}
+
+export type ToolHandler<TInput = unknown, TOutput = unknown> = (
+  input: TInput
+) => Promise<ToolResult<TOutput>>;
