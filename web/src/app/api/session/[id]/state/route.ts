@@ -1,11 +1,12 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { getSession } from "@/lib/sessionStore";
 
 export async function GET(
-  _request: Request,
-  { params }: { params: { id: string } },
+  _request: NextRequest,
+  { params }: { params: Promise<{ id: string }> },
 ) {
-  const state = getSession(params.id);
+  const { id } = await params;
+  const state = getSession(id);
   if (!state) return NextResponse.json({ error: "not found" }, { status: 404 });
   return NextResponse.json(state);
 }

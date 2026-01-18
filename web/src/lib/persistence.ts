@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { EditPlan, Segment, SmoothedTick, TickRaw } from "./types";
+import { EditPlanSpec, Segment, SmoothedTick, TickRaw } from "./types";
 
 const OUTPUT_ROOT = path.resolve(process.cwd(), process.env.OUTPUT_ROOT || "sessions");
 
@@ -38,7 +38,7 @@ export async function persistSegments(sessionId: string, raw: Segment[], final: 
   ]);
 }
 
-export async function persistPlan(sessionId: string, plan: EditPlan) {
+export async function persistPlan(sessionId: string, plan: EditPlanSpec) {
   const file = await sessionPath(sessionId, "edit_plan.json");
   await fs.writeFile(file, JSON.stringify(plan, null, 2), "utf8");
 }

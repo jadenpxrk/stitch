@@ -1,10 +1,10 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { appendTick } from "@/lib/sessionStore";
 import { TickRaw } from "@/lib/types";
 
 export async function POST(
-  request: Request,
-  { params }: { params: { id: string } },
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> },
 ) {
   const body = await request.json().catch(() => ({}));
   const { tick, ts, raw, windowStart, windowEnd, parseError } = body;
@@ -22,7 +22,8 @@ export async function POST(
     },
     parseError: parseError ?? null,
   };
-  const state = await appendTick(params.id, payload);
+  const { id } = await params;
+  const state = await appendTick(id, payload);
   if (!state) return NextResponse.json({ error: "not found" }, { status: 404 });
   return NextResponse.json(state);
 }

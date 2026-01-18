@@ -1,6 +1,9 @@
-import { RealtimeVision, type RealtimeVisionOptions } from "@overshoot/sdk";
+import { RealtimeVision } from "@overshoot/sdk";
 import { appendTick } from "./sessionStore";
 import { TickRaw } from "./types";
+
+type VisionConfig = ConstructorParameters<typeof RealtimeVision>[0];
+type VisionSource = VisionConfig["source"];
 
 const apiUrl = process.env.OVERSHOOT_API_URL || "https://cluster1.overshoot.ai/api/v0.2";
 const apiKey = process.env.OVERSHOOT_API_KEY;
@@ -16,7 +19,7 @@ export function makePrompt(ts: number) {
   )}, "shaky": <boolean>, "confidence": <number 0..1>} No other text. Decide "shaky" if camera motion/jitter makes the footage unpleasant or choppy.`;
 }
 
-function mapSource(source?: string): RealtimeVisionOptions["source"] | undefined {
+function mapSource(source?: string): VisionSource {
   if (!source) return { type: "camera", cameraFacing: "environment" };
   const lower = source.toLowerCase();
   if (lower === "camera:front" || lower === "front") {
@@ -57,21 +60,25 @@ export function createVision(sessionId: string, source?: string) {
     onResult: (result) => {
       tick += 1;
       const elapsed = (Date.now() - startTs) / 1000;
-      let parsed: any = null;
+      let parsed: unknown = null;
       let parseError: string | null = null;
       try {
-        parsed = typeof result.result === "string" ? JSON.parse(result.result) : result.result;
+        const resultObj =
+          result && typeof result === "object" ? (result as Record<string, unknown>) : {};
+        const inner = resultObj.result;
+        parsed = typeof inner === "string" ? JSON.parse(inner) : inner;
       } catch (err) {
         parseError = String(err);
       }
+      const parsedObj = parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
       const raw: TickRaw = {
         tick,
-        ts: Number.isFinite(parsed?.ts) ? Number(parsed.ts) : Number(elapsed.toFixed(1)),
+        ts: Number.isFinite(parsedObj.ts) ? Number(parsedObj.ts) : Number(elapsed.toFixed(1)),
         windowStart: Math.max(0, elapsed - 1),
         windowEnd: elapsed,
         raw: {
-          shaky: Boolean(parsed?.shaky),
-          confidence: Number.isFinite(parsed?.confidence) ? Number(parsed.confidence) : 0,
+          shaky: Boolean(parsedObj.shaky),
+          confidence: Number.isFinite(parsedObj.confidence) ? Number(parsedObj.confidence) : 0,
         },
         parseError,
       };

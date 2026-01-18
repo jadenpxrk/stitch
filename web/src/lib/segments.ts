@@ -1,4 +1,4 @@
-import { Segment, SegmentType, SmoothedTick, TickRaw } from "./types";
+import { Segment, SmoothedTick, TickRaw } from "./types";
 
 const MIN_GOOD = 1.0;
 const MIN_SHAKY = 0.5;
@@ -90,24 +90,23 @@ export function cleanupSegments(segments: Segment[]): Segment[] {
     cleaned.push(seg);
   }
 
-  // Merge GOOD segments split by tiny SHAKY gap < MERGE_GAP
+  // Merge two GOOD segments split by a tiny SHAKY gap < MERGE_GAP
   const merged: Segment[] = [];
   for (let i = 0; i < cleaned.length; i++) {
-    const seg = cleaned[i];
-    const prev = merged.at(-1);
+    const cur = cleaned[i];
     if (
-      prev &&
-      prev.type === "GOOD" &&
-      seg.type === "GOOD" &&
-      i > 0
+      cur.type === "SHAKY" &&
+      cur.end - cur.start < MERGE_GAP &&
+      merged.length > 0 &&
+      i + 1 < cleaned.length &&
+      merged[merged.length - 1].type === "GOOD" &&
+      cleaned[i + 1].type === "GOOD"
     ) {
-      const gap = seg.start - prev.end;
-      if (gap < MERGE_GAP) {
-        prev.end = seg.end;
-        continue;
-      }
+      merged[merged.length - 1].end = cleaned[i + 1].end;
+      i += 1; // skip next GOOD
+      continue;
     }
-    merged.push(seg);
+    merged.push(cur);
   }
 
   return merged.map((seg, idx) => ({

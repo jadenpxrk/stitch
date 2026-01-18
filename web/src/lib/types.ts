@@ -57,7 +57,7 @@ export interface SessionState {
   captions?: CaptionsState;
 }
 
-export interface EditPlan {
+export interface EditPlanSpec {
   version: number;
   duration: number;
   session_id?: string;

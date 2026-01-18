@@ -1,4 +1,4 @@
-import { EditPlan, Segment, SessionState, ShakyFix, TickRaw } from "./types";
+import { EditPlanSpec, SessionState, ShakyFix, TickRaw } from "./types";
 import { buildSegments, cleanupSegments, decorateSegmentsForBridgeAbility, suggestFix } from "./segments";
 import { smoothTicks } from "./smoothing";
 
@@ -180,6 +180,10 @@ export function getSession(id: string): SessionState | null {
   return state ? cloneState(state) : null;
 }
 
+export function getSessionMutable(id: string): SessionState | null {
+  return SESSIONS.get(id) ?? null;
+}
+
 async function fetchRecordingUrl(state: SessionState) {
   const vision = RUNNING.get(state.id);
   if (!vision) return;
@@ -191,7 +195,7 @@ async function fetchRecordingUrl(state: SessionState) {
   }
 }
 
-export function computeEditPlan(id: string): EditPlan | null {
+export function computeEditPlan(id: string): EditPlanSpec | null {
   const state = SESSIONS.get(id);
   if (!state || state.status === "idle") return null;
   return {
@@ -212,7 +216,7 @@ function recompute(state: SessionState) {
   const built = buildSegments(state.smoothed, state.rawTicks);
   const cleaned = cleanupSegments(built);
   const suggested = cleaned.map(suggestFix);
-  const decorated = decorateSegmentsForBridgeAbility(suggested, true);
+  const decorated = decorateSegmentsForBridgeAbility(suggested, !!state.recordingUrl);
   state.segmentsRaw = built;
   state.segmentsFinal = decorated;
 }
