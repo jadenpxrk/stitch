@@ -1,10 +1,11 @@
-import { EditPlanSpec, SessionState, ShakyFix, TickRaw } from "./types";
+import { EditPlanSpec, SessionState, ShakyFix, TickRaw, EarlyFeatures, IntroTrimPrediction, IntroTrimDecision } from "./types";
 import { buildSegments, cleanupSegments, decorateSegmentsForBridgeAbility, suggestFix } from "./segments";
 import { smoothTicks } from "./smoothing";
 
 import { RealtimeVision } from "@overshoot/sdk";
 import { createVision } from "./overshoot";
 import { generateCaptionsForSession } from "./captions";
+import { processIntroTrim } from "./woodwide";
 import {
   ensureSessionDir,
   persistPlan,
@@ -17,6 +18,7 @@ import { fetchRecording } from "./overshootRecording";
 const SESSIONS = new Map<string, SessionState>();
 const RUNNING = new Map<string, RealtimeVision>();
 const CAPTION_JOBS = new Map<string, Promise<void>>();
+const INTRO_TRIM_RESULTS = new Map<string, IntroTrimDecision | null>();
 
 const DEFAULT_SESSION: SessionState = {
   id: "",
@@ -198,6 +200,9 @@ async function fetchRecordingUrl(state: SessionState) {
 export function computeEditPlan(id: string): EditPlanSpec | null {
   const state = SESSIONS.get(id);
   if (!state || state.status === "idle") return null;
+
+  const introTrim = INTRO_TRIM_RESULTS.get(id);
+
   return {
     version: 1,
     duration: state.duration ?? (state.rawTicks.at(-1)?.ts ?? 0),
@@ -208,7 +213,73 @@ export function computeEditPlan(id: string): EditPlanSpec | null {
     captions_vtt_path:
       state.captions?.status === "ready" ? state.captions.vttPath : undefined,
     segments: state.segmentsFinal,
+    intro_trim: introTrim ?? undefined,
   };
+}
+
+export interface ApplyIntroTrimResult {
+  features: EarlyFeatures;
+  prediction: IntroTrimPrediction;
+  decision: IntroTrimDecision | null;
+  error?: string;
+}
+
+export async function applyIntroTrim(
+  id: string,
+  options?: {
+    datasetId?: string;
+    modelId?: string;
+    userId?: string;
+    deviceType?: string;
+  }
+): Promise<ApplyIntroTrimResult | null> {
+  const state = SESSIONS.get(id);
+  if (!state) return null;
+
+  if (state.status !== "stopped") {
+    return {
+      features: {} as EarlyFeatures,
+      prediction: {} as IntroTrimPrediction,
+      decision: null,
+      error: "Session must be stopped before applying intro trim",
+    };
+  }
+
+  if (state.rawTicks.length === 0) {
+    return {
+      features: {} as EarlyFeatures,
+      prediction: {} as IntroTrimPrediction,
+      decision: null,
+      error: "No tick data available",
+    };
+  }
+
+  try {
+    const result = await processIntroTrim(state.rawTicks, state.ticksHz, {
+      userId: options?.userId,
+      deviceType: options?.deviceType,
+      datasetId: options?.datasetId,
+      modelId: options?.modelId,
+    });
+
+    // Store the decision for edit plan
+    INTRO_TRIM_RESULTS.set(id, result.decision);
+
+    // Persist the updated plan
+    const plan = computeEditPlan(id);
+    if (plan) {
+      await persistPlan(id, plan);
+    }
+
+    return result;
+  } catch (error) {
+    return {
+      features: {} as EarlyFeatures,
+      prediction: {} as IntroTrimPrediction,
+      decision: null,
+      error: error instanceof Error ? error.message : "Unknown error",
+    };
+  }
 }
 
 function recompute(state: SessionState) {
