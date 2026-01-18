@@ -1,9 +1,6 @@
 import fs from "node:fs/promises";
-import { createWriteStream } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { Readable } from "node:stream";
-import { pipeline } from "node:stream/promises";
 import { spawn } from "node:child_process";
 import { ensureSessionDir, getSessionDir } from "./persistence";
 
@@ -79,8 +76,8 @@ async function downloadFile(url: string, destPath: string) {
   if (!res.ok) {
     throw new Error(`Failed to download recording: ${res.status} ${res.statusText}`);
   }
-  if (!res.body) throw new Error("Recording download returned empty body");
-  await pipeline(Readable.fromWeb(res.body as any), createWriteStream(destPath));
+  const buf = Buffer.from(await res.arrayBuffer());
+  await fs.writeFile(destPath, buf);
 }
 
 async function extractAudio(inputPath: string, outputPath: string) {
@@ -147,30 +144,29 @@ async function transcribeAudio(audioPath: string) {
   return res.json();
 }
 
-function extractSegments(payload: any): TranscriptSegment[] {
+function extractSegments(payload: unknown): TranscriptSegment[] {
   if (!payload) return [];
 
   const direct = findSegments(payload);
   if (direct.length) return direct;
 
-  if (Array.isArray(payload.words)) {
+  if (isRecord(payload) && Array.isArray(payload.words)) {
     return groupWords(payload.words);
   }
 
   return [];
 }
 
-function findSegments(payload: any): TranscriptSegment[] {
+function findSegments(payload: unknown): TranscriptSegment[] {
+  if (!isRecord(payload)) return [];
   const candidates =
-    payload.segments ||
-    payload.utterances ||
-    payload.transcripts ||
-    payload.chunks;
+    payload.segments ?? payload.utterances ?? payload.transcripts ?? payload.chunks;
   if (!Array.isArray(candidates)) return [];
   return candidates
-    .map((seg: any) => {
-      const start = toNumber(seg.start ?? seg.start_time ?? seg.startTime);
-      let end = toNumber(seg.end ?? seg.end_time ?? seg.endTime);
+    .map((seg): TranscriptSegment | null => {
+      if (!isRecord(seg)) return null;
+      const start = toNumber(seg.start ?? seg["start_time"] ?? seg["startTime"]);
+      let end = toNumber(seg.end ?? seg["end_time"] ?? seg["endTime"]);
       if (!Number.isFinite(end) || end <= start) {
         end = start + 0.5;
       }
@@ -180,10 +176,13 @@ function findSegments(payload: any): TranscriptSegment[] {
         text: String(seg.text ?? seg.transcript ?? seg.value ?? "").trim(),
       };
     })
-    .filter((seg: TranscriptSegment) => seg.text && Number.isFinite(seg.start));
+    .filter(
+      (seg): seg is TranscriptSegment =>
+        seg != null && Boolean(seg.text) && Number.isFinite(seg.start),
+    );
 }
 
-function groupWords(words: any[]): TranscriptSegment[] {
+function groupWords(words: unknown[]): TranscriptSegment[] {
   const segments: TranscriptSegment[] = [];
   let start: number | null = null;
   let end = 0;
@@ -202,10 +201,11 @@ function groupWords(words: any[]): TranscriptSegment[] {
   };
 
   for (const word of words) {
+    if (!isRecord(word)) continue;
     const token = String(word.text ?? word.word ?? "").trim();
     if (!token) continue;
-    const wordStart = toNumber(word.start ?? word.start_time ?? word.startTime);
-    const wordEnd = toNumber(word.end ?? word.end_time ?? word.endTime);
+    const wordStart = toNumber(word.start ?? word["start_time"] ?? word["startTime"]);
+    const wordEnd = toNumber(word.end ?? word["end_time"] ?? word["endTime"]);
     if (!Number.isFinite(wordStart)) continue;
     const nextText = appendWord(text, token);
     const nextDuration =
@@ -267,6 +267,10 @@ function formatTimestamp(seconds: number) {
 
 function pad(value: number) {
   return String(value).padStart(2, "0");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 function toNumber(value: unknown) {
