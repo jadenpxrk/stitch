@@ -17,6 +17,9 @@
 /.next/
 /out/
 
+# local output
+/sessions/
+
 # production
 /build
 
