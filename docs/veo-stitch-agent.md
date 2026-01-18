@@ -43,7 +43,7 @@ fal.config({ credentials: process.env.FAL_KEY });
 | `prompt` | `string` | Yes | Describe how motion should connect the frames. |
 | `first_frame_url` | `string \| Blob \| File` | Yes | First frame image (URL or uploaded file). |
 | `last_frame_url` | `string \| Blob \| File` | Yes | Last frame image (URL or uploaded file). |
-| `duration` | `"4s" \| "6s" \| "8s"` | No | Choose the smallest value ≥ desired duration, then trim with FFmpeg. |
+| `duration` | `"4s" \| "6s" \| "8s"` | No | Choose the smallest value ≥ desired duration, then time-warp to the exact segment duration (e.g. `setpts`). |
 | `resolution` | `"720p" \| "1080p"` | No | Pick the closest to your recording, then scale to match exact concat requirements. |
 | `aspect_ratio` | `"auto" \| "16:9" \| "9:16"` | No | Use `"auto"` unless you must force. |
 | `generate_audio` | `boolean` | No | Defaults to `true`; we recommend `false` and add silence in post. |
@@ -126,15 +126,15 @@ Our renderer concatenates pieces with `-c copy`, so the bridge must match the pr
 - Exact target duration (trim/pad)
 - Same frame size as the other pieces (match your recording)
 
-Conceptual post-process:
+Conceptual post-process (time-warp the full Veo clip to match the shaky segment length, then pad with the last frame so the clip still ends cleanly):
 
 ```bash
 ffmpeg -y \
   -i raw.mp4 \
   -f lavfi -t "$DURATION" -i anullsrc=channel_layout=stereo:sample_rate=44100 \
   -map 0:v:0 -map 1:a:0 -shortest \
-  -t "$DURATION" \
-  -c:v libx264 -pix_fmt yuv420p -r 30 \
+  -vf "setpts=$SPEED*PTS,tpad=stop_mode=clone:stop_duration=1,format=yuv420p" \
+  -t "$DURATION" -c:v libx264 -pix_fmt yuv420p -r 30 \
   -c:a aac -ar 44100 -ac 2 \
   out.mp4
 ```
@@ -170,7 +170,7 @@ The render pipeline will call your command for each `BRIDGE` segment. If the com
 
 ## Limitations
 
-- fal’s Veo endpoint exposes discrete durations (`"4s"`, `"6s"`, `"8s"`): trim to exact segment length.
+- fal’s Veo endpoint exposes discrete durations (`"4s"`, `"6s"`, `"8s"`): time-warp to the exact segment length.
 - Output must be normalized (fps/codec/audio/size) for `ffmpeg concat -c copy`.
 
 ## References

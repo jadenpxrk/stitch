@@ -110,10 +110,22 @@ async function generateThumbnailLocal(inputJpg: string, outJpg: string) {
 }
 
 async function runNanoBanana(inputJpg: string, outJpg: string) {
-  const cmd = process.env.NANO_BANANA_CMD;
+  const cmdRaw = process.env.NANO_BANANA_CMD;
+  if (!cmdRaw) return false;
+  const cmd = cmdRaw.replace(/\s+#.*$/, "").trim();
   if (!cmd) return false;
-  const child = spawn(cmd, [inputJpg, outJpg], { stdio: "inherit" });
-  const exitCode: number | null = await new Promise((resolve) => child.on("close", resolve));
+
+  const args = [inputJpg, outJpg];
+  const ext = path.extname(cmd).toLowerCase();
+  const looksLikeNodeScript = ext === ".js" || ext === ".mjs" || ext === ".cjs";
+  const command = looksLikeNodeScript ? process.execPath : cmd;
+  const commandArgs = looksLikeNodeScript ? [cmd, ...args] : args;
+
+  const child = spawn(command, commandArgs, { stdio: "inherit" });
+  const exitCode: number | null = await new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", resolve);
+  });
   if (exitCode !== 0) {
     throw new Error(`NANO_BANANA_CMD failed (exit ${exitCode}): ${cmd}`);
   }
@@ -253,7 +265,13 @@ export async function POST(request: Request) {
         const outCandidate = path.join(framesDir, `${baseName}.jpg`);
         const outGenerated = path.join(thumbsDir, `thumb_${String(i).padStart(2, "0")}.jpg`);
         await extractFrame(inputPath, safeTs, outCandidate);
-        const usedNanoBanana = await runNanoBanana(outCandidate, outGenerated);
+        let usedNanoBanana = false;
+        try {
+          usedNanoBanana = await runNanoBanana(outCandidate, outGenerated);
+        } catch (err) {
+          console.error("NANO_BANANA_CMD failed; falling back to local thumbnail generation.", err);
+          usedNanoBanana = false;
+        }
         if (!usedNanoBanana) {
           await generateThumbnailLocal(outCandidate, outGenerated);
         }

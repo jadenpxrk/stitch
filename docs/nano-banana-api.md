@@ -237,6 +237,30 @@ console.log(result.data.images);
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+### Wiring in This Repo
+
+In the Next.js app, the Thumbnail Agent sends the video + chosen frame timestamps to `POST /api/analysis/extract`.
+That route:
+- extracts frames with ffmpeg
+- runs Nano Banana if `NANO_BANANA_CMD` is set (otherwise falls back to a local ffmpeg enhancement filter)
+
+Enable Nano Banana (fal.ai) by pointing `NANO_BANANA_CMD` at the included script:
+
+```bash
+cd web
+export FAL_KEY="YOUR_FAL_KEY"
+export NANO_BANANA_CMD="scripts/nano-banana.mjs"
+```
+
+Optional overrides:
+
+```bash
+export NANO_BANANA_PROMPT="..."
+export NANO_BANANA_RESOLUTION="1K"   # 1K | 2K | 4K
+export NANO_BANANA_ASPECT_RATIO="16:9"
+export NANO_BANANA_OUTPUT_FORMAT="jpeg"
+```
+
 ### Example Implementation
 
 ```typescript
