@@ -33,6 +33,14 @@ export interface Segment {
   bridgeAllowed?: boolean;
 }
 
+export interface CaptionsState {
+  status: "idle" | "running" | "ready" | "error";
+  startedAt?: number;
+  finishedAt?: number;
+  vttPath?: string;
+  error?: string;
+}
+
 export interface SessionState {
   id: string;
   status: "idle" | "running" | "stopped";
@@ -46,6 +54,7 @@ export interface SessionState {
   duration: number | null;
   source?: string;
   recordingUrl?: string | null;
+  captions?: CaptionsState;
 }
 
 export interface EditPlan {
@@ -55,5 +64,6 @@ export interface EditPlan {
   source?: string;
   recording_url?: string;
   ticks_hz?: number;
+  captions_vtt_path?: string;
   segments: Segment[];
 }

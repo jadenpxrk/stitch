@@ -46,3 +46,7 @@ export async function persistPlan(sessionId: string, plan: EditPlan) {
 export async function ensureSessionDir(sessionId: string) {
   await ensureDir(sessionDir(sessionId));
 }
+
+export function getSessionDir(sessionId: string) {
+  return sessionDir(sessionId);
+}

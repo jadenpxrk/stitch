@@ -4,6 +4,7 @@ import { smoothTicks } from "./smoothing";
 
 import { RealtimeVision } from "@overshoot/sdk";
 import { createVision } from "./overshoot";
+import { generateCaptionsForSession } from "./captions";
 import {
   ensureSessionDir,
   persistPlan,
@@ -15,6 +16,7 @@ import { fetchRecording } from "./overshootRecording";
 
 const SESSIONS = new Map<string, SessionState>();
 const RUNNING = new Map<string, RealtimeVision>();
+const CAPTION_JOBS = new Map<string, Promise<void>>();
 
 const DEFAULT_SESSION: SessionState = {
   id: "",
@@ -28,6 +30,8 @@ const DEFAULT_SESSION: SessionState = {
   segmentsFinal: [],
   duration: null,
   source: undefined,
+  recordingUrl: null,
+  captions: { status: "idle" },
 };
 
 function cloneState(base: SessionState): SessionState {
@@ -106,6 +110,57 @@ export async function appendTick(id: string, tick: TickRaw): Promise<SessionStat
   return state;
 }
 
+export async function generateCaptions(
+  id: string,
+  recordingUrl?: string,
+): Promise<SessionState | null> {
+  const state = SESSIONS.get(id);
+  if (!state) return null;
+  if (recordingUrl) {
+    state.recordingUrl = recordingUrl;
+  }
+  if (state.status !== "stopped") {
+    state.captions = { status: "error", error: "session not stopped" };
+    return state;
+  }
+  if (!state.recordingUrl) {
+    state.captions = { status: "error", error: "recordingUrl missing" };
+    return state;
+  }
+  if (state.captions?.status === "running") return state;
+  if (state.captions?.status === "ready" && state.captions.vttPath) {
+    return state;
+  }
+
+  state.captions = { status: "running", startedAt: Date.now() };
+
+  const job = (async () => {
+    const vttPath = await generateCaptionsForSession(state.id, state.recordingUrl!);
+    state.captions = {
+      status: "ready",
+      vttPath,
+      startedAt: state.captions?.startedAt,
+      finishedAt: Date.now(),
+    };
+    const plan = computeEditPlan(state.id);
+    if (plan) {
+      await persistPlan(state.id, plan);
+    }
+  })().catch((err) => {
+    state.captions = {
+      status: "error",
+      error: String(err),
+      startedAt: state.captions?.startedAt,
+      finishedAt: Date.now(),
+    };
+  });
+
+  CAPTION_JOBS.set(id, job);
+  await job;
+  CAPTION_JOBS.delete(id);
+  return state;
+}
+
 export function setUserFix(
   id: string,
   segmentId: string,
@@ -146,6 +201,8 @@ export function computeEditPlan(id: string): EditPlan | null {
     source: state.source,
     recording_url: state.recordingUrl ?? undefined,
     ticks_hz: state.ticksHz,
+    captions_vtt_path:
+      state.captions?.status === "ready" ? state.captions.vttPath : undefined,
     segments: state.segmentsFinal,
   };
 }

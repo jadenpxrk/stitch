@@ -20,14 +20,20 @@ const formatSeconds = (s: number | null | undefined) =>
 export default function Home() {
   const [sessionId, setSessionId] = useState<string>("demo-session");
   const [source, setSource] = useState<string>("webcam");
+  const [recordingUrl, setRecordingUrl] = useState<string>("");
   const [state, setState] = useState<SessionState | null>(null);
   const [exportPlan, setExportPlan] = useState<EditPlan | null>(null);
+  const [isGeneratingCaptions, setIsGeneratingCaptions] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const shakySegments = useMemo(
     () => state?.segmentsFinal.filter((s) => s.type === "SHAKY") ?? [],
     [state],
   );
+  const captions = state?.captions;
+  const captionsReady = captions?.status === "ready" && !!captions.vttPath;
+  const canGenerateCaptions =
+    !!sessionId && !!recordingUrl && state?.status === "stopped";
 
   const start = async () => {
     setError(null);
@@ -48,7 +54,7 @@ export default function Home() {
     try {
       const res = await api<SessionState>("/api/session/stop", {
         method: "POST",
-        body: JSON.stringify({ sessionId }),
+        body: JSON.stringify({ sessionId, recordingUrl: recordingUrl || undefined }),
       });
       setState(res);
     } catch (e) {
@@ -90,6 +96,23 @@ export default function Home() {
     }
   };
 
+  const generateCaptions = async () => {
+    if (!sessionId) return;
+    setError(null);
+    setIsGeneratingCaptions(true);
+    try {
+      const res = await api<SessionState>(`/api/session/${sessionId}/captions`, {
+        method: "POST",
+        body: JSON.stringify({ recordingUrl: recordingUrl || undefined }),
+      });
+      setState(res);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setIsGeneratingCaptions(false);
+    }
+  };
+
   const simulateTick = async (shaky: boolean) => {
     if (!sessionId) return;
     const ts = (state?.rawTicks.length ?? 0) + 1;
@@ -114,6 +137,12 @@ export default function Home() {
     refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (state?.recordingUrl && !recordingUrl) {
+      setRecordingUrl(state.recordingUrl);
+    }
+  }, [recordingUrl, state?.recordingUrl]);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-800 text-slate-50">
@@ -174,6 +203,17 @@ export default function Home() {
                 Refresh
               </button>
             </div>
+            <label className="flex flex-col gap-1 text-sm md:col-span-3">
+              <span className="text-xs uppercase tracking-[0.15em] text-slate-400">
+                Recording URL (required for captions)
+              </span>
+              <input
+                value={recordingUrl}
+                onChange={(e) => setRecordingUrl(e.target.value)}
+                placeholder="https://.../recording.mp4 or /path/to/file"
+                className="rounded-lg border border-white/10 bg-white/10 px-3 py-2 text-sm text-white outline-none focus:border-cyan-400"
+              />
+            </label>
           </div>
 
           <div className="flex flex-wrap items-center gap-3 text-sm text-slate-200">
@@ -222,6 +262,39 @@ export default function Home() {
               <p className="text-sm text-slate-400">No segments yet.</p>
             )}
           </div>
+        </section>
+
+        <section className="rounded-2xl border border-white/10 bg-white/5 p-4 shadow-lg backdrop-blur">
+          <div className="flex flex-wrap items-center gap-3">
+            <button
+              onClick={generateCaptions}
+              className="rounded-lg bg-indigo-400 px-3 py-2 text-sm font-semibold text-slate-950 transition hover:bg-indigo-300 disabled:opacity-60"
+              disabled={!canGenerateCaptions || isGeneratingCaptions}
+            >
+              {isGeneratingCaptions ? "Generating..." : "Generate captions (VTT)"}
+            </button>
+            <span className="text-sm text-slate-300">
+              Status: {captions?.status ?? "idle"}
+            </span>
+            {captionsReady && (
+              <a
+                href={`/api/session/${sessionId}/captions/file`}
+                className="text-sm font-semibold text-indigo-200 hover:text-indigo-100"
+              >
+                Download VTT
+              </a>
+            )}
+          </div>
+          {captions?.status === "error" && (
+            <div className="mt-3 text-xs text-red-200">
+              {captions.error ?? "Caption generation failed."}
+            </div>
+          )}
+          {!recordingUrl && (
+            <div className="mt-3 text-xs text-slate-400">
+              Provide a recording URL or local path to enable captioning.
+            </div>
+          )}
         </section>
 
         <section className="rounded-2xl border border-white/10 bg-white/5 p-4 shadow-lg backdrop-blur">
