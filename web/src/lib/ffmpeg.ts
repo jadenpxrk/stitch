@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import fs from "node:fs";
 
 type RunOptions = {
   cwd?: string;
@@ -19,23 +20,64 @@ export class CommandError extends Error {
   }
 }
 
+function stripInlineComment(value: string) {
+  return value.replace(/\s+#.*$/, "").trim();
+}
+
+function resolveCommand(envVarName: string, fallback: string) {
+  const raw = process.env[envVarName];
+  if (!raw) return fallback;
+  const cleaned = stripInlineComment(raw);
+  if (!cleaned) return fallback;
+  // If it's an absolute/relative path, validate it exists; otherwise assume it's a binary name on PATH.
+  if (cleaned.includes("/") || cleaned.includes("\\")) {
+    return fs.existsSync(cleaned) ? cleaned : fallback;
+  }
+  return cleaned;
+}
+
+function isEnoent(err: unknown): err is NodeJS.ErrnoException {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    "code" in err &&
+    (err as { code?: unknown }).code === "ENOENT"
+  );
+}
+
 async function run(command: string, args: string[], opts: RunOptions = {}) {
-  const child = spawn(command, args, { cwd: opts.cwd });
   let stdout = "";
   let stderr = "";
+  let timedOut = false;
 
-  child.stdout.on("data", (d) => (stdout += String(d)));
-  child.stderr.on("data", (d) => (stderr += String(d)));
+  const child = spawn(command, args, { cwd: opts.cwd });
+
+  child.stdout?.on("data", (d) => (stdout += String(d)));
+  child.stderr?.on("data", (d) => (stderr += String(d)));
 
   const timeoutMs = opts.timeoutMs ?? 5 * 60_000;
   const timeout = setTimeout(() => {
+    timedOut = true;
     child.kill("SIGKILL");
   }, timeoutMs);
 
-  const exitCode: number | null = await new Promise((resolve) => {
-    child.on("close", resolve);
-  });
-  clearTimeout(timeout);
+  let exitCode: number | null = null;
+  try {
+    exitCode = await new Promise((resolve, reject) => {
+      child.on("error", (err) => reject(err));
+      child.on("close", resolve);
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  if (timedOut) {
+    throw new CommandError(`Command timed out after ${timeoutMs}ms: ${command} ${args.join(" ")}`, {
+      stdout,
+      stderr,
+      exitCode,
+    });
+  }
 
   if (exitCode !== 0) {
     throw new CommandError(`Command failed: ${command} ${args.join(" ")}`, {
@@ -49,13 +91,60 @@ async function run(command: string, args: string[], opts: RunOptions = {}) {
 }
 
 export async function runFfmpeg(args: string[], opts: RunOptions = {}) {
-  const ffmpeg = process.env.FFMPEG_PATH || "ffmpeg";
-  return run(ffmpeg, args, opts);
+  const ffmpeg = resolveCommand("FFMPEG_PATH", "ffmpeg");
+  try {
+    return await run(ffmpeg, args, opts);
+  } catch (err) {
+    // If a configured absolute path is invalid, fall back to PATH lookup + common locations.
+    if (isEnoent(err)) {
+      const candidates =
+        process.platform === "darwin"
+          ? ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
+          : ["/usr/bin/ffmpeg", "/bin/ffmpeg"];
+
+      if (ffmpeg !== "ffmpeg") {
+        try {
+          return await run("ffmpeg", args, opts);
+        } catch (err2) {
+          if (!isEnoent(err2)) throw err2;
+        }
+      }
+
+      for (const candidate of candidates) {
+        if (!fs.existsSync(candidate)) continue;
+        return run(candidate, args, opts);
+      }
+    }
+    throw err;
+  }
 }
 
 export async function runFfprobe(args: string[], opts: RunOptions = {}) {
-  const ffprobe = process.env.FFPROBE_PATH || "ffprobe";
-  return run(ffprobe, args, opts);
+  const ffprobe = resolveCommand("FFPROBE_PATH", "ffprobe");
+  try {
+    return await run(ffprobe, args, opts);
+  } catch (err) {
+    if (isEnoent(err)) {
+      const candidates =
+        process.platform === "darwin"
+          ? ["/opt/homebrew/bin/ffprobe", "/usr/local/bin/ffprobe", "/usr/bin/ffprobe"]
+          : ["/usr/bin/ffprobe", "/bin/ffprobe"];
+
+      if (ffprobe !== "ffprobe") {
+        try {
+          return await run("ffprobe", args, opts);
+        } catch (err2) {
+          if (!isEnoent(err2)) throw err2;
+        }
+      }
+
+      for (const candidate of candidates) {
+        if (!fs.existsSync(candidate)) continue;
+        return run(candidate, args, opts);
+      }
+    }
+    throw err;
+  }
 }
 
 export async function hasAudio(inputPath: string): Promise<boolean> {
@@ -79,4 +168,3 @@ export async function hasAudio(inputPath: string): Promise<boolean> {
     return false;
   }
 }
-

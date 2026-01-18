@@ -241,17 +241,32 @@ async function runExternalBridge(opts: {
   lastJpg: string;
   duration: number;
   outPath: string;
-}) {
-  const cmd = process.env.VEO_BRIDGE_CMD;
-  if (!cmd) return false;
+}): Promise<{ used: boolean; error?: string }> {
+  const cmdRaw = process.env.VEO_BRIDGE_CMD;
+  if (!cmdRaw) return { used: false };
+
+  const cmd = cmdRaw.replace(/\s+#.*$/, "").trim();
+  if (!cmd) return { used: false };
 
   const args = [opts.firstJpg, opts.lastJpg, opts.outPath, opts.duration.toFixed(3)];
-  const child = spawn(cmd, args, { stdio: "inherit" });
-  const exitCode: number | null = await new Promise((resolve) => child.on("close", resolve));
-  if (exitCode !== 0) {
-    throw new Error(`VEO_BRIDGE_CMD failed (exit ${exitCode}): ${cmd}`);
+
+  const ext = path.extname(cmd).toLowerCase();
+  const looksLikeNodeScript = ext === ".js" || ext === ".mjs" || ext === ".cjs";
+  const command = looksLikeNodeScript ? process.execPath : cmd;
+  const commandArgs = looksLikeNodeScript ? [cmd, ...args] : args;
+
+  try {
+    const child = spawn(command, commandArgs, { stdio: "inherit" });
+    const exitCode: number | null = await new Promise((resolve, reject) => {
+      child.on("error", reject);
+      child.on("close", resolve);
+    });
+
+    if (exitCode === 0) return { used: true };
+    return { used: false, error: `VEO_BRIDGE_CMD failed (exit ${exitCode}): ${cmd}` };
+  } catch (err) {
+    return { used: false, error: `VEO_BRIDGE_CMD error: ${err instanceof Error ? err.message : String(err)}` };
   }
-  return true;
 }
 
 export async function renderFinalMp4(opts: {
@@ -275,7 +290,7 @@ export async function renderFinalMp4(opts: {
   for (let i = 0; i < opts.plan.segments.length; i++) {
     const seg = opts.plan.segments[i];
     const duration = Math.max(0, seg.end - seg.start);
-    const fix: ShakyFix = seg.final_fix;
+    const fix: ShakyFix = seg.finalFix;
 
     if (seg.type === "GOOD") {
       if (fix !== "KEEP") continue;
@@ -321,7 +336,7 @@ export async function renderFinalMp4(opts: {
           workDir,
           outPath: out,
         });
-        updatedSegments[i].final_fix = "STABILIZE";
+        updatedSegments[i].finalFix = "STABILIZE";
         updatedSegments[i].outputs["stabilized_clip_path"] = path.relative(dir, out);
         const piece = path.join(piecesDir, `piece_${String(piecePaths.length).padStart(4, "0")}.mp4`);
         await fs.copyFile(out, piece);
@@ -346,8 +361,12 @@ export async function renderFinalMp4(opts: {
       await extractFrame(opts.recordingPath, tAfter, lastJpg);
 
       const out = path.join(bridgesDir, `${seg.id || `seg_${i}`}.mp4`);
-      const usedExternal = await runExternalBridge({ firstJpg, lastJpg, duration, outPath: out });
-      if (!usedExternal) {
+      const external = await runExternalBridge({ firstJpg, lastJpg, duration, outPath: out });
+      if (!external.used) {
+        if (external.error) {
+          updatedSegments[i].outputs = { ...(updatedSegments[i].outputs ?? {}) };
+          updatedSegments[i].outputs["bridge_error"] = external.error;
+        }
         await renderFallbackBridgePiece({ firstJpg, lastJpg, duration, outPath: out });
       }
 
