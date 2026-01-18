@@ -23,6 +23,11 @@ const FFMPEG_PATH = process.env.FFMPEG_PATH || "ffmpeg";
 const MAX_CUE_DURATION_S = 6;
 const MAX_CUE_CHARS = 84;
 
+// Filler words to remove from captions
+const FILLER_WORDS = new Set(["umm", "um", "uh", "uhh", "ah", "ahh", "hmm", "hm", "er", "erm"]);
+// "like" is only a filler when standalone (not part of "I like", "like this", etc.)
+const FILLER_LIKE_PATTERN = /^like$/i;
+
 export async function generateCaptionsForSession(
   sessionId: string,
   recordingUrl: string,
@@ -34,8 +39,10 @@ export async function generateCaptionsForSession(
   const audioPath = path.join(sessionDir, "audio.wav");
   await extractAudio(recordingPath, audioPath);
   const transcript = await transcribeAudio(audioPath);
-  const segments = extractSegments(transcript);
-  if (!segments.length) throw new Error("No timestamped segments returned.");
+  const rawSegments = extractSegments(transcript);
+  if (!rawSegments.length) throw new Error("No timestamped segments returned.");
+  const segments = filterFillerWords(rawSegments);
+  if (!segments.length) throw new Error("All segments empty after filler removal.");
   const vtt = formatVtt(segments);
   const vttRelPath = "captions.vtt";
   await fs.writeFile(path.join(sessionDir, vttRelPath), vtt, "utf8");
@@ -272,4 +279,66 @@ function pad(value: number) {
 function toNumber(value: unknown) {
   const num = typeof value === "string" ? Number(value) : Number(value ?? NaN);
   return Number.isFinite(num) ? num : NaN;
+}
+
+/**
+ * Check if a word is a standalone filler word.
+ * "like" is only considered filler when it's standalone and not part of meaningful context.
+ */
+function isFillerWord(word: string, prevWord?: string, nextWord?: string): boolean {
+  const lower = word.toLowerCase().replace(/[.,!?;:]+$/, "");
+
+  // Direct filler words
+  if (FILLER_WORDS.has(lower)) {
+    return true;
+  }
+
+  // "like" is filler only when standalone (not "I like", "like this", "looks like")
+  if (FILLER_LIKE_PATTERN.test(lower)) {
+    const prevLower = prevWord?.toLowerCase();
+    const nextLower = nextWord?.toLowerCase();
+
+    // Keep "like" if preceded by subject pronouns or verbs indicating preference
+    const meaningfulPrev = ["i", "you", "we", "they", "would", "dont", "don't", "really", "do"];
+    if (prevLower && meaningfulPrev.includes(prevLower)) {
+      return false;
+    }
+
+    // Keep "like" if followed by "this", "that", "a", "the", or similar
+    const meaningfulNext = ["this", "that", "a", "an", "the", "it", "them", "him", "her", "me", "us"];
+    if (nextLower && meaningfulNext.includes(nextLower)) {
+      return false;
+    }
+
+    // Otherwise, standalone "like" is filler
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Filter filler words from segment text while preserving timestamps.
+ * Normalizes whitespace and drops segments that become empty.
+ */
+export function filterFillerWords(segments: TranscriptSegment[]): TranscriptSegment[] {
+  return segments
+    .map((seg) => {
+      const words = seg.text.split(/\s+/);
+      const filtered: string[] = [];
+
+      for (let i = 0; i < words.length; i++) {
+        const word = words[i];
+        const prevWord = i > 0 ? words[i - 1] : undefined;
+        const nextWord = i < words.length - 1 ? words[i + 1] : undefined;
+
+        if (!isFillerWord(word, prevWord, nextWord)) {
+          filtered.push(word);
+        }
+      }
+
+      const text = filtered.join(" ").replace(/\s+/g, " ").trim();
+      return { ...seg, text };
+    })
+    .filter((seg) => seg.text.length > 0);
 }
