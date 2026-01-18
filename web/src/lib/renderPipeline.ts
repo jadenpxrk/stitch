@@ -275,7 +275,7 @@ export async function renderFinalMp4(opts: {
   for (let i = 0; i < opts.plan.segments.length; i++) {
     const seg = opts.plan.segments[i];
     const duration = Math.max(0, seg.end - seg.start);
-    const fix: ShakyFix = seg.final_fix;
+    const fix: ShakyFix = seg.finalFix;
 
     if (seg.type === "GOOD") {
       if (fix !== "KEEP") continue;
@@ -321,7 +321,7 @@ export async function renderFinalMp4(opts: {
           workDir,
           outPath: out,
         });
-        updatedSegments[i].final_fix = "STABILIZE";
+        updatedSegments[i].finalFix = "STABILIZE";
         updatedSegments[i].outputs["stabilized_clip_path"] = path.relative(dir, out);
         const piece = path.join(piecesDir, `piece_${String(piecePaths.length).padStart(4, "0")}.mp4`);
         await fs.copyFile(out, piece);
