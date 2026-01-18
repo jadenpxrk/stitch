@@ -120,6 +120,12 @@ function pickDurationSeconds(targetSeconds) {
   return "8s";
 }
 
+function durationStringToSeconds(duration) {
+  if (duration === "4s") return 4;
+  if (duration === "6s") return 6;
+  return 8;
+}
+
 async function getImageDims(imagePath) {
   const { stdout } = await runFfprobe([
     "-v",
@@ -139,6 +145,22 @@ async function getImageDims(imagePath) {
   const height = Number(m[2]);
   if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return null;
   return { width, height };
+}
+
+async function getVideoDurationSeconds(videoPath) {
+  const { stdout } = await runFfprobe([
+    "-v",
+    "error",
+    "-show_entries",
+    "format=duration",
+    "-of",
+    "default=nw=1:nk=1",
+    videoPath,
+  ]);
+
+  const parsed = Number.parseFloat(stdout.trim());
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return parsed;
 }
 
 function chooseResolution(value, dims) {
@@ -203,12 +225,13 @@ async function main() {
     const firstBlob = new Blob([await fsp.readFile(firstJpgPath)], { type: "image/jpeg" });
     const lastBlob = new Blob([await fsp.readFile(lastJpgPath)], { type: "image/jpeg" });
 
+    const requestedDuration = pickDurationSeconds(targetSeconds);
     const result = await fal.subscribe(endpoint, {
       input: {
         prompt,
         first_frame_url: firstBlob,
         last_frame_url: lastBlob,
-        duration: pickDurationSeconds(targetSeconds),
+        duration: requestedDuration,
         aspect_ratio: aspectRatio,
         resolution,
         generate_audio: false,
@@ -232,7 +255,18 @@ async function main() {
 
     const duration = targetSeconds.toFixed(3);
 
-    const vf = dims ? `scale=${dims.width}:${dims.height},format=yuv420p` : "format=yuv420p";
+    const rawDurationSeconds =
+      (await getVideoDurationSeconds(rawMp4Path).catch(() => null)) ?? durationStringToSeconds(requestedDuration);
+
+    // Veo supports discrete durations (4s/6s/8s). To hit the exact target duration AND
+    // preserve the provided last frame, time-warp the full generated clip to `targetSeconds`,
+    // then pad by cloning the last frame (so we never cut before it).
+    const speedFactor = Math.max(0.01, Math.min(1, targetSeconds / rawDurationSeconds));
+    const setpts = `setpts=${speedFactor.toFixed(6)}*PTS`;
+    const scale = dims ? `scale=${dims.width}:${dims.height}` : null;
+    const vf = [scale, "setsar=1", setpts, "tpad=stop_mode=clone:stop_duration=1", "format=yuv420p"]
+      .filter(Boolean)
+      .join(",");
 
     await runFfmpeg([
       "-y",
@@ -279,4 +313,3 @@ main().catch((err) => {
   console.error(err instanceof Error ? err.stack || err.message : String(err));
   process.exit(1);
 });
-

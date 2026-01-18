@@ -19,7 +19,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { ToastProvider, toastManager } from "@/components/ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { OvershootAnalyzer } from "@/components/overshoot/overshoot-analyzer";
+import { VideoAgentsPanel } from "@/components/agents/video-agents";
 import {
   CropIcon,
   FilmIcon,
@@ -62,6 +62,8 @@ type ClipDropTarget = {
   targetId: string;
   position: "before" | "after";
 };
+
+type ClipTrimHandle = "start" | "end";
 
 function formatTime(seconds: number) {
   const s = Math.max(0, seconds);
@@ -332,12 +334,15 @@ function ThemeToggle({
 export default function Home() {
   const videoRef = React.useRef<HTMLVideoElement | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement | null>(null);
+  const timelineTrackRef = React.useRef<HTMLDivElement | null>(null);
+  const pendingAutoplayNextClipRef = React.useRef(false);
 
   const [theme, setTheme] = React.useState<Theme>("dark");
   const [error, setError] = React.useState<string | null>(null);
   const [clips, setClips] = React.useState<Clip[]>([]);
   const [selectedClipId, setSelectedClipId] = React.useState<string | null>(null);
   const clipsRef = React.useRef<Clip[]>([]);
+  const lastSelectedFileRef = React.useRef<File | null>(null);
   const clipPointerDragRef = React.useRef<{
     clipId: string;
     pointerId: number;
@@ -366,7 +371,15 @@ export default function Home() {
   const [timelineHoverTime, setTimelineHoverTime] = React.useState<number | null>(null);
   const [draggingClipId, setDraggingClipId] = React.useState<string | null>(null);
   const [clipDropTarget, setClipDropTarget] = React.useState<ClipDropTarget | null>(null);
+  const [trimmingClipId, setTrimmingClipId] = React.useState<string | null>(null);
   const [isExporting, setIsExporting] = React.useState<boolean>(false);
+  const [fillGapsWithBlack, setFillGapsWithBlack] = React.useState<boolean>(false);
+
+  const clipTrimRef = React.useRef<{
+    clipId: string;
+    handle: ClipTrimHandle;
+    pointerId: number;
+  } | null>(null);
 
   const trimStart = selectedClip?.in ?? 0;
   const trimEnd = selectedClip?.out ?? 0;
@@ -384,6 +397,7 @@ export default function Home() {
 
   React.useEffect(() => {
     if (!selectedFile) {
+      pendingAutoplayNextClipRef.current = false;
       setVideoUrl(null);
       setPosterUrl(null);
       setDuration(0);
@@ -410,23 +424,59 @@ export default function Home() {
     clipsRef.current = clips;
   }, [clips]);
 
+  const advanceToNextClip = React.useCallback(() => {
+    if (pendingAutoplayNextClipRef.current) return true;
+    const currentId = selectedClipId;
+    if (!currentId) return false;
+    const ordered = clipsRef.current;
+    const idx = ordered.findIndex((c) => c.id === currentId);
+    if (idx < 0 || idx >= ordered.length - 1) return false;
+
+    pendingAutoplayNextClipRef.current = true;
+    setSelectedClipId(ordered[idx + 1].id);
+    return true;
+  }, [selectedClipId]);
+
   React.useEffect(() => {
     if (!selectedClipId) return;
     const clip = clipsRef.current.find((c) => c.id === selectedClipId);
     if (!clip) return;
+    const fileSwitched =
+      lastSelectedFileRef.current !== null && lastSelectedFileRef.current !== clip.file;
     const v = videoRef.current;
     if (v) v.pause();
     setIsPlaying(false);
     setIsCropping(false);
-    setCurrentTime(clip.in);
-    if (v) v.currentTime = clip.in;
-  }, [selectedClipId]);
+
+    const end = clip.out > 0 ? clip.out : duration;
+    const safeEnd = Math.max(0, end - 0.001);
+    const prevTime = v?.currentTime ?? clip.in;
+    const nextTime =
+      !fileSwitched && prevTime >= clip.in && prevTime <= safeEnd
+        ? prevTime
+        : clamp(clip.in, 0, Math.max(0, duration - 0.001));
+
+    setCurrentTime(nextTime);
+    if (v) v.currentTime = nextTime;
+    lastSelectedFileRef.current = clip.file;
+
+    if (pendingAutoplayNextClipRef.current && !fileSwitched && v) {
+      pendingAutoplayNextClipRef.current = false;
+      void v.play().catch((e) => setError(`Playback failed: ${String(e)}`));
+    }
+  }, [duration, selectedClipId]);
 
   const canEdit = Boolean(selectedClip) && Boolean(videoUrl) && duration > 0;
   const maxTime = Math.max(0.01, duration || 1);
   const effectiveTrimEnd = trimEnd > 0 ? trimEnd : duration;
   const hasCrop = canEdit && !isDefaultCrop(cropRect);
-  const canExport = canEdit && effectiveTrimEnd > trimStart && !isExporting;
+  const hasMultipleSourceFiles = React.useMemo(() => {
+    if (clips.length <= 1) return false;
+    const base = clips[0]?.file;
+    if (!base) return false;
+    return clips.some((c) => c.file !== base);
+  }, [clips]);
+  const canExport = clips.length > 0 && !isExporting && !hasMultipleSourceFiles;
 
   const canZoomOut = canEdit && zoom > 0.5;
   const canZoomIn = canEdit && zoom < 4;
@@ -441,11 +491,6 @@ export default function Home() {
     return Math.max(720, Math.round(width));
   }, [duration, zoom]);
 
-  const trimLeftPx = duration > 0 ? (trimStart / duration) * timelineWidthPx : 0;
-  const trimRightPx =
-    duration > 0
-      ? (effectiveTrimEnd / duration) * timelineWidthPx
-      : timelineWidthPx;
   const playheadPx =
     duration > 0 ? (currentTime / duration) * timelineWidthPx : 0;
 
@@ -598,6 +643,97 @@ export default function Home() {
       setClipDropTarget(null);
     };
 
+  const getTimelineTimeFromClientX = (clientX: number) => {
+    const el = timelineTrackRef.current;
+    if (!el) return null;
+    if (duration <= 0) return null;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0) return null;
+    const x = clientX - rect.left;
+    const ratio = clamp(x / rect.width, 0, 1);
+    return ratio * duration;
+  };
+
+  const onPointerDownClipTrimHandle =
+    (clipId: string, handle: ClipTrimHandle): React.PointerEventHandler<HTMLDivElement> =>
+    (e) => {
+      if (!canEdit || isBladeMode) return;
+      e.preventDefault();
+      e.stopPropagation();
+      clipTrimRef.current = { clipId, handle, pointerId: e.pointerId };
+      setTrimmingClipId(clipId);
+      setSelectedClipId(clipId);
+      videoRef.current?.pause();
+      setIsPlaying(false);
+      e.currentTarget.setPointerCapture(e.pointerId);
+    };
+
+  const onPointerMoveClipTrimHandle: React.PointerEventHandler<HTMLDivElement> = (e) => {
+    const drag = clipTrimRef.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    if (!canEdit) return;
+    const tRaw = getTimelineTimeFromClientX(e.clientX);
+    if (tRaw == null) return;
+    const t = Number(tRaw.toFixed(2));
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    setClips((prev) => {
+      const clip = prev.find((c) => c.id === drag.clipId);
+      if (!clip) return prev;
+
+      const minLen = SPLIT_MIN_GAP_S;
+
+      const file = clip.file;
+      const siblings = prev
+        .filter((c) => c.file === file)
+        .slice()
+        .sort((a, b) => a.in - b.in);
+      const idx = siblings.findIndex((c) => c.id === drag.clipId);
+      if (idx < 0) return prev;
+
+      const prevSibling = idx > 0 ? siblings[idx - 1] : null;
+      const nextSibling = idx < siblings.length - 1 ? siblings[idx + 1] : null;
+
+      const clipIn = clamp(clip.in, 0, duration);
+      const clipOut = clamp(clip.out > 0 ? clip.out : duration, 0, duration);
+      const start = Math.min(clipIn, clipOut);
+      const end = Math.max(clipIn, clipOut);
+
+      const prevEnd = prevSibling
+        ? clamp(prevSibling.out > 0 ? prevSibling.out : duration, 0, duration)
+        : 0;
+      const nextStart = nextSibling ? clamp(nextSibling.in, 0, duration) : duration;
+
+      if (drag.handle === "start") {
+        const minStart = prevSibling ? prevEnd : 0;
+        const maxStart = end - minLen;
+        if (maxStart <= minStart) return prev;
+        const nextIn = clamp(t, minStart, maxStart);
+        return prev.map((c) => (c.id === clip.id ? { ...c, in: nextIn } : c));
+      }
+
+      const minEnd = start + minLen;
+      const maxEnd = nextSibling ? nextStart : duration;
+      if (maxEnd <= minEnd) return prev;
+      const nextOut = clamp(t, minEnd, maxEnd);
+      return prev.map((c) => (c.id === clip.id ? { ...c, out: nextOut } : c));
+    });
+  };
+
+  const onPointerEndClipTrimHandle: React.PointerEventHandler<HTMLDivElement> = (e) => {
+    const drag = clipTrimRef.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    clipTrimRef.current = null;
+    setTrimmingClipId(null);
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+  };
+
   const seek = (t: number) => {
     const v = videoRef.current;
     if (!v) return;
@@ -717,9 +853,18 @@ export default function Home() {
   };
 
   const exportClip = async () => {
-    if (!selectedClip) return;
-    if (duration <= 0) return;
-    if (effectiveTrimEnd <= trimStart) return;
+    if (clips.length === 0) return;
+    if (hasMultipleSourceFiles) {
+      toastManager.add({
+        title: "Export not supported",
+        description: "Sequence export currently supports a single source file.",
+        type: "error",
+      });
+      return;
+    }
+
+    const baseFile = clips[0]?.file;
+    if (!baseFile) return;
 
     setIsExporting(true);
     setError(null);
@@ -727,12 +872,20 @@ export default function Home() {
 
     try {
       const formData = new FormData();
-      formData.append("file", selectedClip.file, selectedClip.file.name);
-      formData.append("trimStart", String(trimStart));
-      formData.append("trimEnd", String(effectiveTrimEnd));
-      formData.append("crop", JSON.stringify(cropRect));
+      formData.append("file", baseFile, baseFile.name);
+      formData.append(
+        "clips",
+        JSON.stringify(
+          clips.map((c) => ({
+            in: c.in,
+            out: c.out,
+            crop: c.crop,
+          })),
+        ),
+      );
+      formData.append("fillGaps", String(fillGapsWithBlack));
 
-      const res = await fetch("/api/edit", {
+      const res = await fetch("/api/stitch", {
         method: "POST",
         body: formData,
       });
@@ -742,16 +895,15 @@ export default function Home() {
         const msg = (() => {
           if (typeof maybeJson?.error === "string") return maybeJson.error;
           if (res.status === 404) {
-            return "Export endpoint not found (/api/edit). If you just added the route, restart the dev server.";
+            return "Export endpoint not found (/api/stitch). Restart the dev server.";
           }
           return `Export failed (${res.status})`;
         })();
         throw new Error(msg);
       }
 
-      const base = selectedClip.file.name.replace(/\\.mp4$/i, "");
-      const part = selectedClipIndex >= 0 ? `_clip_${selectedClipIndex + 1}` : "";
-      const fileName = `${base || "video"}${part}_edited.mp4`;
+      const base = baseFile.name.replace(/\\.mp4$/i, "");
+      const fileName = `${base || "video"}_sequence${fillGapsWithBlack ? "_gapfill" : ""}.mp4`;
 
       const showSaveFilePicker = (window as unknown as { showSaveFilePicker?: unknown })
         .showSaveFilePicker as
@@ -791,7 +943,7 @@ export default function Home() {
 
       toastManager.add({
         title: "Export complete",
-        description: "Downloaded edited video.",
+        description: "Downloaded sequence as a single MP4.",
         type: "success",
       });
     } catch (err: unknown) {
@@ -809,6 +961,7 @@ export default function Home() {
   const clearProject = () => {
     const v = videoRef.current;
     if (v) v.pause();
+    pendingAutoplayNextClipRef.current = false;
     setClips([]);
     setSelectedClipId(null);
   };
@@ -840,8 +993,25 @@ export default function Home() {
                   <FolderOpenIcon className="size-4" />
                   Add clip
                 </Button>
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <div className="flex items-center gap-2 text-muted-foreground text-xs">
+                        <span>Fill gaps</span>
+                        <Switch
+                          checked={fillGapsWithBlack}
+                          disabled={hasMultipleSourceFiles}
+                          onCheckedChange={setFillGapsWithBlack}
+                        />
+                      </div> as React.ReactElement<Record<string, unknown>>
+                    }
+                  />
+                  <TooltipContent>
+                    Export timeline gaps as black video + silence.
+                  </TooltipContent>
+                </Tooltip>
                 <Button disabled={!canExport} onClick={exportClip} size="sm" variant="secondary">
-                  {isExporting ? "Exporting…" : "Export clip"}
+                  {isExporting ? "Exporting…" : "Export"}
                 </Button>
                 <Button onClick={clearProject} size="sm" variant="ghost">
                   Clear
@@ -951,6 +1121,15 @@ export default function Home() {
                         const start = clamp(trimStart, 0, Math.max(0, d - 0.001));
                         v.currentTime = start;
                         setCurrentTime(start);
+
+                        if (pendingAutoplayNextClipRef.current) {
+                          pendingAutoplayNextClipRef.current = false;
+                          void v.play().catch((err) => setError(`Playback failed: ${String(err)}`));
+                        }
+                      }}
+                      onEnded={() => {
+                        if (advanceToNextClip()) return;
+                        setIsPlaying(false);
                       }}
                       onPause={() => setIsPlaying(false)}
                       onPlay={() => setIsPlaying(true)}
@@ -961,7 +1140,12 @@ export default function Home() {
                           setCurrentTime(trimStart);
                           return;
                         }
-                        if (effectiveTrimEnd > 0 && t > effectiveTrimEnd) {
+                        if (
+                          !e.currentTarget.paused &&
+                          effectiveTrimEnd > 0 &&
+                          t >= Math.max(0, effectiveTrimEnd - 0.001)
+                        ) {
+                          if (advanceToNextClip()) return;
                           e.currentTarget.pause();
                           e.currentTarget.currentTime = effectiveTrimEnd;
                           setCurrentTime(effectiveTrimEnd);
@@ -1190,11 +1374,12 @@ export default function Home() {
 
                     <div className="overflow-hidden rounded-xl border bg-muted/40">
                       <ScrollArea scrollbarGutter>
-                        <div
-                          className={`relative h-18 select-none ${isBladeMode ? "cursor-crosshair" : "cursor-pointer"}`}
-                          onPointerDown={(e) => {
-                            if (!duration || !canEdit) return;
-                            const rect = e.currentTarget.getBoundingClientRect();
+	                        <div
+                          ref={timelineTrackRef}
+	                          className={`relative h-18 select-none ${isBladeMode ? "cursor-crosshair" : "cursor-pointer"}`}
+	                          onPointerDown={(e) => {
+	                            if (!duration || !canEdit) return;
+	                            const rect = e.currentTarget.getBoundingClientRect();
                             const x = e.clientX - rect.left;
                             const ratio = clamp(x / rect.width, 0, 1);
                             const t = ratio * duration;
@@ -1203,6 +1388,14 @@ export default function Home() {
                               return;
                             }
                             seek(t);
+                            if (!selectedClip) return;
+                            const file = selectedClip.file;
+                            const candidate = clips.find((c) => {
+                              if (c.file !== file) return false;
+                              const end = c.out > 0 ? c.out : duration;
+                              return t >= c.in && t <= end;
+                            });
+                            if (candidate) setSelectedClipId(candidate.id);
                           }}
                           onPointerLeave={() => setTimelineHoverTime(null)}
                           onPointerMove={(e) => {
@@ -1220,32 +1413,82 @@ export default function Home() {
                             backgroundSize: `${Math.max(24, Math.round(60 * zoom))}px 100%`,
                           }}
                         >
+                          {canEdit && selectedClip && duration > 0 && (
+                            <div className="absolute inset-y-3 left-0 right-0">
+                              {clips
+                                .filter((c) => c.file === selectedClip.file)
+                                .slice()
+                                .sort((a, b) => a.in - b.in)
+                                .map((clip) => {
+                                  const start = clamp(clip.in, 0, duration);
+                                  const end = clamp(clip.out > 0 ? clip.out : duration, 0, duration);
+                                  const orderedStart = Math.min(start, end);
+                                  const orderedEnd = Math.max(start, end);
+                                  if (orderedEnd <= orderedStart) return null;
+
+                                  const leftPx = (orderedStart / duration) * timelineWidthPx;
+                                  const rightPx = (orderedEnd / duration) * timelineWidthPx;
+                                  const widthPx = rightPx - leftPx;
+                                  const gapPx = 4;
+                                  const insetLeftPx = leftPx + gapPx / 2;
+                                  const insetWidthPx = Math.max(0, widthPx - gapPx);
+                                  if (insetWidthPx <= 0) return null;
+
+                                  const isSelected = clip.id === selectedClipId;
+                                  return (
+                                    <div
+                                      key={clip.id}
+                                      className={`group absolute inset-y-0 rounded-lg border bg-warning/8 shadow-xs/5 transition-[box-shadow,border-color] before:pointer-events-none before:absolute before:inset-0 before:rounded-[calc(var(--radius-lg)-1px)] before:shadow-[inset_0_1px_0_rgba(255,255,255,0.35)] ${isSelected ? "z-10 border-warning/56 ring-2 ring-warning/16" : "z-0 border-warning/32"} dark:bg-warning/16 dark:before:shadow-[inset_0_1px_0_rgba(255,255,255,0.18)]`}
+                                      style={{ left: `${insetLeftPx}px`, width: `${insetWidthPx}px` }}
+                                    >
+                                      {!isBladeMode && canEdit && (
+                                        <>
+                                          <div
+                                            className={`absolute inset-y-0 left-0 w-2 touch-none cursor-ew-resize opacity-0 transition-opacity group-hover:opacity-100 ${isSelected || trimmingClipId === clip.id ? "opacity-100" : ""}`}
+                                            onPointerCancel={onPointerEndClipTrimHandle}
+                                            onPointerDown={onPointerDownClipTrimHandle(clip.id, "start")}
+                                            onPointerMove={onPointerMoveClipTrimHandle}
+                                            onPointerUp={onPointerEndClipTrimHandle}
+                                            role="presentation"
+                                          >
+                                            <div className="absolute inset-y-2 left-1/2 w-px -translate-x-1/2 rounded bg-warning/70" />
+                                          </div>
+                                          <div
+                                            className={`absolute inset-y-0 right-0 w-2 touch-none cursor-ew-resize opacity-0 transition-opacity group-hover:opacity-100 ${isSelected || trimmingClipId === clip.id ? "opacity-100" : ""}`}
+                                            onPointerCancel={onPointerEndClipTrimHandle}
+                                            onPointerDown={onPointerDownClipTrimHandle(clip.id, "end")}
+                                            onPointerMove={onPointerMoveClipTrimHandle}
+                                            onPointerUp={onPointerEndClipTrimHandle}
+                                            role="presentation"
+                                          >
+                                            <div className="absolute inset-y-2 left-1/2 w-px -translate-x-1/2 rounded bg-warning/70" />
+                                          </div>
+                                        </>
+                                      )}
+                                    </div>
+                                  );
+                                })}
+                            </div>
+                          )}
                           <div
-                            className="pointer-events-none absolute inset-y-0 bg-primary/12"
-                            style={{
-                              left: `${trimLeftPx}px`,
-                              width: `${Math.max(0, trimRightPx - trimLeftPx)}px`,
-                            }}
-                          />
-                          <div
-                            className="pointer-events-none absolute inset-y-0 w-px bg-primary"
+                            className="pointer-events-none absolute inset-y-0 z-20 w-px bg-primary"
                             style={{ left: `${playheadPx}px` }}
                           />
                           {isBladeMode && timelineHoverPx != null && timelineHoverTime != null && (
                             <>
                               <div
-                                className="pointer-events-none absolute inset-y-0 w-px bg-destructive"
+                                className="pointer-events-none absolute inset-y-0 z-30 w-px bg-destructive"
                                 style={{ left: `${timelineHoverPx}px` }}
                               />
                               <div
-                                className="pointer-events-none absolute bottom-2 -translate-x-1/2 rounded-md bg-background/80 px-1.5 py-0.5 text-xs text-foreground tabular-nums shadow"
+                                className="pointer-events-none absolute bottom-2 z-30 -translate-x-1/2 rounded-md bg-background/80 px-1.5 py-0.5 text-xs text-foreground tabular-nums shadow"
                                 style={{ left: `${timelineHoverPx}px` }}
                               >
                                 {formatTime(timelineHoverTime)}
                               </div>
                             </>
                           )}
-                          <div className="pointer-events-none absolute bottom-2 left-2 right-2 flex items-center justify-between text-muted-foreground text-xs tabular-nums">
+                          <div className="pointer-events-none absolute bottom-2 left-2 right-2 z-20 flex items-center justify-between text-muted-foreground text-xs tabular-nums">
                             <span>0:00.0</span>
                             <span>{formatTime(duration)}</span>
                           </div>
@@ -1259,9 +1502,9 @@ export default function Home() {
               <aside className="min-h-0 lg:pl-6 max-lg:pt-6">
                 <div className="flex flex-col gap-4">
                   <div>
-                    <div className="font-semibold text-sm">AI Assistant</div>
+                    <div className="font-semibold text-sm">Agents</div>
                     <div className="text-muted-foreground text-xs">
-                      Placeholder panel — will drive edits from natural language.
+                      Run specialized agents to generate assets and suggestions.
                     </div>
                   </div>
 
@@ -1271,9 +1514,9 @@ export default function Home() {
                         <SparklesIcon className="size-4" />
                         Copilot
                       </TabsTrigger>
-                      <TabsTrigger value="overshoot">
+                      <TabsTrigger value="agents">
                         <FolderOpenIcon className="size-4" />
-                        Overshoot
+                        Agents
                       </TabsTrigger>
                       <TabsTrigger value="notes">
                         <FilmIcon className="size-4" />
@@ -1293,8 +1536,8 @@ export default function Home() {
                       </div>
                     </TabsContent>
 
-                    <TabsContent className="mt-4" value="overshoot">
-                      <OvershootAnalyzer
+                    <TabsContent className="mt-4" value="agents">
+                      <VideoAgentsPanel
                         file={selectedFile}
                         durationSeconds={duration}
                         onSelectThumbnail={(url) => setPosterUrl(url)}
