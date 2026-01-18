@@ -1,6 +1,8 @@
 "use client";
 
 import * as React from "react";
+import { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import { SessionState, EditPlanSpec } from "@/lib/types";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
@@ -63,7 +65,59 @@ function isDefaultCrop(crop: CropRect) {
   return crop.x === 0 && crop.y === 0 && crop.w === 1 && crop.h === 1;
 }
 
+async function api<T>(url: string, options?: RequestInit): Promise<T> {
+  const res = await fetch(url, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...(options?.headers ?? {}),
+    },
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(text || `API error: ${res.status}`);
+  }
+  return res.json();
+}
+
 type CropHandle = "move" | "nw" | "ne" | "sw" | "se";
+
+function SegmentRow({
+  seg,
+  onChangeFix,
+}: {
+  seg: { id: string; start: number; end: number; type: string; finalFix: string };
+  onChangeFix: (fix: string) => void;
+}) {
+  const isShaky = seg.type === "SHAKY";
+  return (
+    <div
+      className={`flex items-center justify-between rounded-lg border p-3 text-sm ${
+        isShaky ? "border-red-400/30 bg-red-500/10" : "border-green-400/30 bg-green-500/10"
+      }`}
+    >
+      <div>
+        <span className="font-medium">
+          {formatTime(seg.start)} - {formatTime(seg.end)}
+        </span>
+        <span className={`ml-2 text-xs ${isShaky ? "text-red-300" : "text-green-300"}`}>
+          {seg.type}
+        </span>
+      </div>
+      {isShaky && (
+        <select
+          value={seg.finalFix}
+          onChange={(e) => onChangeFix(e.target.value)}
+          className="rounded border border-white/20 bg-white/10 px-2 py-1 text-xs"
+        >
+          <option value="CUT">Cut</option>
+          <option value="STABILIZE">Stabilize</option>
+          <option value="BRIDGE">Bridge</option>
+        </select>
+      )}
+    </div>
+  );
+}
 
 function CropOverlay({
   crop,
@@ -283,9 +337,39 @@ export default function Home() {
   const [source, setSource] = useState<string>("webcam");
   const [recordingUrl, setRecordingUrl] = useState<string>("");
   const [state, setState] = useState<SessionState | null>(null);
-  const [exportPlan, setExportPlan] = useState<EditPlan | null>(null);
+  const [exportPlan, setExportPlan] = useState<EditPlanSpec | null>(null);
   const [isGeneratingCaptions, setIsGeneratingCaptions] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Video player state
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const [duration, setDuration] = useState(0);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [trimStart, setTrimStart] = useState(0);
+  const [trimEnd, setTrimEnd] = useState(0);
+  const [zoom, setZoom] = useState(1);
+  const [isCropping, setIsCropping] = useState(false);
+  const [cropRect, setCropRect] = useState<CropRect>(DEFAULT_CROP);
+
+  const effectiveTrimEnd = trimEnd || duration;
+  const maxTime = duration || 1;
+  const videoUrl = state?.recordingUrl || recordingUrl || null;
+  const canEdit = !!videoUrl && duration > 0;
+
+  // Timeline calculations
+  const baseWidth = 600;
+  const timelineWidthPx = baseWidth * zoom;
+  const trimLeftPx = duration > 0 ? (trimStart / duration) * timelineWidthPx : 0;
+  const trimRightPx = duration > 0 ? (effectiveTrimEnd / duration) * timelineWidthPx : timelineWidthPx;
+  const playheadPx = duration > 0 ? (currentTime / duration) * timelineWidthPx : 0;
+
+  const seek = useCallback((time: number) => {
+    if (videoRef.current) {
+      videoRef.current.currentTime = time;
+      setCurrentTime(time);
+    }
+  }, []);
 
   const shakySegments = useMemo(
     () => state?.segmentsFinal.filter((s) => s.type === "SHAKY") ?? [],
@@ -310,7 +394,7 @@ export default function Home() {
     }
   };
 
-  const ingestFile = (incoming: File) => {
+  const ingestFile = async (incoming: File) => {
     const isMp4 =
       incoming.type === "video/mp4" || incoming.name.toLowerCase().endsWith(".mp4");
     if (!isMp4) {
@@ -326,6 +410,40 @@ export default function Home() {
       const res = await api<SessionState>("/api/session/stop", {
         method: "POST",
         body: JSON.stringify({ sessionId, recordingUrl: recordingUrl || undefined }),
+      });
+      setState(res);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const stop = async () => {
+    setError(null);
+    try {
+      const res = await api<SessionState>("/api/session/stop", {
+        method: "POST",
+        body: JSON.stringify({ sessionId, recordingUrl: recordingUrl || undefined }),
+      });
+      setState(res);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const refresh = async () => {
+    try {
+      const res = await api<SessionState>(`/api/session/${sessionId}/state`);
+      setState(res);
+    } catch {
+      // Session might not exist yet
+    }
+  };
+
+  const updateFix = async (segmentId: string, fix: string) => {
+    try {
+      const res = await api<SessionState>(`/api/session/${sessionId}/segment/${segmentId}`, {
+        method: "POST",
+        body: JSON.stringify({ fix }),
       });
       setState(res);
     } catch (e) {
@@ -372,7 +490,7 @@ export default function Home() {
 
   const doExport = async () => {
     try {
-      const res = await api<EditPlan>(`/api/session/${sessionId}/export`);
+      const res = await api<EditPlanSpec>(`/api/session/${sessionId}/export`);
       setExportPlan(res);
     } catch (e) {
       setError(String(e));
@@ -428,8 +546,9 @@ export default function Home() {
   }, [recordingUrl, state?.recordingUrl]);
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-800 text-slate-50">
-      <div className="mx-auto flex max-w-5xl flex-col gap-6 px-6 py-10">
+    <ToastProvider>
+      <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-800 text-slate-50">
+        <div className="mx-auto flex max-w-5xl flex-col gap-6 px-6 py-10">
         <header className="flex flex-col gap-2">
           <p className="text-xs uppercase tracking-[0.2em] text-slate-400">
             Overshoot Auto-Editor
@@ -632,154 +751,108 @@ export default function Home() {
           )}
         </section>
 
-                <section className="space-y-4">
-                  <div className="flex items-end justify-between gap-4">
-                    <div>
-                      <div className="font-semibold text-sm">Timeline</div>
-                      <div className="text-muted-foreground text-xs">
-                        Trim start/end, scrub, and zoom.
-                      </div>
-                    </div>
+        <section className="space-y-4">
+          <div className="flex items-end justify-between gap-4">
+            <div>
+              <div className="font-semibold text-sm">Timeline</div>
+              <div className="text-muted-foreground text-xs">
+                Trim start/end, scrub, and zoom.
+              </div>
+            </div>
 
                     <div className="flex items-center gap-2 text-muted-foreground text-sm tabular-nums">
-                      <span>In: {formatTime(trimStart)}</span>
-                      <Separator className="h-4" orientation="vertical" />
-                      <span>Out: {formatTime(effectiveTrimEnd)}</span>
-                    </div>
-                  </div>
-
-                  <div className="grid gap-4">
-                    <div>
-                      <div className="mb-2 flex items-center justify-between text-muted-foreground text-xs">
-                        <span>Trim</span>
-                        <span className="tabular-nums">
-                          {(effectiveTrimEnd - trimStart).toFixed(1)}s selected
-                        </span>
-                      </div>
-                      <Slider
-                        disabled={!canEdit}
-                        max={maxTime}
-                        min={0}
-                        step={0.01}
-                        value={[trimStart, effectiveTrimEnd]}
-                        onValueChange={(value) => {
-                          if (!Array.isArray(value)) return;
-                          const [a, b] = value;
-                          const nextStart = clamp(a, 0, duration);
-                          const nextEnd = clamp(b, 0, duration);
-                          const orderedStart = Math.min(nextStart, nextEnd);
-                          const orderedEnd = Math.max(nextStart, nextEnd);
-                          setTrimStart(orderedStart);
-                          setTrimEnd(orderedEnd);
-                          if (currentTime < orderedStart) seek(orderedStart);
-                          if (currentTime > orderedEnd) seek(Math.max(0, orderedEnd - 0.001));
-                        }}
-                      />
-                    </div>
-
-                    <div>
-                      <div className="mb-2 flex items-center justify-between text-muted-foreground text-xs">
-                        <span>Playhead</span>
-                        <span className="tabular-nums">{formatTime(currentTime)}</span>
-                      </div>
-                      <Slider
-                        disabled={!canEdit}
-                        max={maxTime}
-                        min={0}
-                        step={0.01}
-                        value={[currentTime]}
-                        onValueChange={(value) => {
-                          const next = Array.isArray(value) ? value[0] : value;
-                          seek(next);
-                        }}
-                      />
-                    </div>
-
-                    <div className="overflow-hidden rounded-xl border bg-muted/40">
-                      <ScrollArea scrollbarGutter>
-                        <div
-                          className="relative h-18 select-none"
-                          onPointerDown={(e) => {
-                            if (!duration) return;
-                            const rect = e.currentTarget.getBoundingClientRect();
-                            const x = e.clientX - rect.left;
-                            const ratio = clamp(x / rect.width, 0, 1);
-                            seek(ratio * duration);
-                          }}
-                          role="presentation"
-                          style={{
-                            width: timelineWidthPx,
-                            backgroundImage:
-                              "linear-gradient(to right, color-mix(in srgb, var(--foreground) 6%, transparent) 1px, transparent 1px)",
-                            backgroundSize: `${Math.max(24, Math.round(60 * zoom))}px 100%`,
-                          }}
-                        >
-                          <div
-                            className="pointer-events-none absolute inset-y-0 bg-primary/12"
-                            style={{
-                              left: `${trimLeftPx}px`,
-                              width: `${Math.max(0, trimRightPx - trimLeftPx)}px`,
-                            }}
-                          />
-                          <div
-                            className="pointer-events-none absolute inset-y-0 w-px bg-primary"
-                            style={{ left: `${playheadPx}px` }}
-                          />
-                          <div className="pointer-events-none absolute bottom-2 left-2 right-2 flex items-center justify-between text-muted-foreground text-xs tabular-nums">
-                            <span>0:00.0</span>
-                            <span>{formatTime(duration)}</span>
-                          </div>
-                        </div>
-                      </ScrollArea>
-                    </div>
-                  </div>
-                </section>
-              </div>
-
-              <aside className="min-h-0 lg:pl-6 max-lg:pt-6">
-                <div className="flex flex-col gap-4">
-                  <div>
-                    <div className="font-semibold text-sm">AI Assistant</div>
-                    <div className="text-muted-foreground text-xs">
-                      Placeholder panel — will drive edits from natural language.
-                    </div>
-                  </div>
-
-                  <Tabs defaultValue="copilot">
-                    <TabsList>
-                      <TabsTrigger value="copilot">
-                        <SparklesIcon className="size-4" />
-                        Copilot
-                      </TabsTrigger>
-                      <TabsTrigger value="notes">
-                        <FilmIcon className="size-4" />
-                        Notes
-                      </TabsTrigger>
-                    </TabsList>
-
-                    <TabsContent className="mt-4" value="copilot">
-                      <div className="flex flex-col gap-3">
-                        <Textarea placeholder='Try: "Remove pauses", "Add jump cuts", "Zoom on speaker", "Add captions"...' />
-                        <Button disabled variant="secondary">
-                          Generate edit plan (coming soon)
-                        </Button>
-                        <div className="text-muted-foreground text-xs">
-                          Tip: we’ll surface suggestions here and apply them to the timeline.
-                        </div>
-                      </div>
-                    </TabsContent>
-
-                    <TabsContent className="mt-4" value="notes">
-                      <div className="rounded-xl border bg-muted/40 p-4 text-sm text-muted-foreground">
-                        This area can show transcripts, detected chapters, suggested cuts,
-                        and export options.
-                      </div>
-                    </TabsContent>
-                  </Tabs>
-                </div>
-              </aside>
+              <span>In: {formatTime(trimStart)}</span>
+              <Separator className="h-4" orientation="vertical" />
+              <span>Out: {formatTime(effectiveTrimEnd)}</span>
             </div>
-          )}
+          </div>
+
+          <div className="grid gap-4">
+            <div>
+              <div className="mb-2 flex items-center justify-between text-muted-foreground text-xs">
+                <span>Trim</span>
+                <span className="tabular-nums">
+                  {(effectiveTrimEnd - trimStart).toFixed(1)}s selected
+                </span>
+              </div>
+              <Slider
+                disabled={!canEdit}
+                max={maxTime}
+                min={0}
+                step={0.01}
+                value={[trimStart, effectiveTrimEnd]}
+                onValueChange={(value) => {
+                  if (!Array.isArray(value)) return;
+                  const [a, b] = value;
+                  const nextStart = clamp(a, 0, duration);
+                  const nextEnd = clamp(b, 0, duration);
+                  const orderedStart = Math.min(nextStart, nextEnd);
+                  const orderedEnd = Math.max(nextStart, nextEnd);
+                  setTrimStart(orderedStart);
+                  setTrimEnd(orderedEnd);
+                  if (currentTime < orderedStart) seek(orderedStart);
+                  if (currentTime > orderedEnd) seek(Math.max(0, orderedEnd - 0.001));
+                }}
+              />
+            </div>
+
+            <div>
+              <div className="mb-2 flex items-center justify-between text-muted-foreground text-xs">
+                <span>Playhead</span>
+                <span className="tabular-nums">{formatTime(currentTime)}</span>
+              </div>
+              <Slider
+                disabled={!canEdit}
+                max={maxTime}
+                min={0}
+                step={0.01}
+                value={[currentTime]}
+                onValueChange={(value) => {
+                  const next = Array.isArray(value) ? value[0] : value;
+                  seek(next);
+                }}
+              />
+            </div>
+
+            <div className="overflow-hidden rounded-xl border bg-muted/40">
+              <ScrollArea scrollbarGutter>
+                <div
+                  className="relative h-18 select-none"
+                  onPointerDown={(e) => {
+                    if (!duration) return;
+                    const rect = e.currentTarget.getBoundingClientRect();
+                    const x = e.clientX - rect.left;
+                    const ratio = clamp(x / rect.width, 0, 1);
+                    seek(ratio * duration);
+                  }}
+                  role="presentation"
+                  style={{
+                    width: timelineWidthPx,
+                    backgroundImage:
+                      "linear-gradient(to right, color-mix(in srgb, var(--foreground) 6%, transparent) 1px, transparent 1px)",
+                    backgroundSize: `${Math.max(24, Math.round(60 * zoom))}px 100%`,
+                  }}
+                >
+                  <div
+                    className="pointer-events-none absolute inset-y-0 bg-primary/12"
+                    style={{
+                      left: `${trimLeftPx}px`,
+                      width: `${Math.max(0, trimRightPx - trimLeftPx)}px`,
+                    }}
+                  />
+                  <div
+                    className="pointer-events-none absolute inset-y-0 w-px bg-primary"
+                    style={{ left: `${playheadPx}px` }}
+                  />
+                  <div className="pointer-events-none absolute bottom-2 left-2 right-2 flex items-center justify-between text-muted-foreground text-xs tabular-nums">
+                    <span>0:00.0</span>
+                    <span>{formatTime(duration)}</span>
+                  </div>
+                </div>
+              </ScrollArea>
+            </div>
+          </div>
+        </section>
         </div>
       </div>
     </ToastProvider>
