@@ -29,17 +29,90 @@ export async function generateCaptionsForSession(
   const sessionDir = getSessionDir(sessionId);
   const recordingPath = await resolveRecordingPath(recordingUrl, sessionDir);
   const audioPath = path.join(sessionDir, "audio.wav");
-  await extractAudio(recordingPath, audioPath);
-  const transcript = await transcribeAudio(audioPath);
-  const segments = extractSegments(transcript);
+  const segments = await generateCaptionsSegmentsFromRecording(recordingPath, audioPath);
   if (!segments.length) throw new Error("No timestamped segments returned.");
   const vtt = formatVtt(segments);
   const vttRelPath = "captions.vtt";
   await fs.writeFile(path.join(sessionDir, vttRelPath), vtt, "utf8");
+  return vttRelPath;
+}
+
+export async function generateCaptionsVttFromRecording(recordingPath: string): Promise<string> {
+  const tmpAudioPath = `${recordingPath}.audio.wav`;
+  const segments = await generateCaptionsSegmentsFromRecording(recordingPath, tmpAudioPath);
+  if (!segments.length) throw new Error("No timestamped segments returned.");
+  return formatVtt(segments);
+}
+
+async function generateCaptionsSegmentsFromRecording(recordingPath: string, audioPath: string) {
+  await extractAudio(recordingPath, audioPath);
+  const transcript = await transcribeAudio(audioPath);
+  const segments = filterFillerWords(extractSegments(transcript));
   if (process.env.CAPTIONS_KEEP_AUDIO !== "1") {
     await fs.unlink(audioPath).catch(() => undefined);
   }
-  return vttRelPath;
+  return segments;
+}
+
+const FILLER_WORDS = new Set(["um", "umm", "uh", "er", "hmm", "ah"]);
+
+function normalizeToken(token: string) {
+  return token
+    .toLowerCase()
+    .replace(/^[^a-z0-9']+/gi, "")
+    .replace(/[^a-z0-9']+$/gi, "");
+}
+
+function shouldRemoveLike(tokens: string[], index: number): boolean {
+  const prev = index > 0 ? normalizeToken(tokens[index - 1] ?? "") : "";
+  const next = index + 1 < tokens.length ? normalizeToken(tokens[index + 1] ?? "") : "";
+
+  if (prev === "i") return false;
+  if (next === "this" || next === "that") return false;
+  return true;
+}
+
+export function filterFillerWords(segments: TranscriptSegment[]): TranscriptSegment[] {
+  if (!segments.length) return [];
+
+  const out: TranscriptSegment[] = [];
+
+  for (const seg of segments) {
+    const tokens = String(seg.text ?? "").split(/\s+/).filter(Boolean);
+    const kept: string[] = [];
+
+    for (let i = 0; i < tokens.length; i++) {
+      const token = tokens[i]!;
+      const norm = normalizeToken(token);
+
+      if (!norm) {
+        continue;
+      }
+
+      if (norm === "like") {
+        if (shouldRemoveLike(tokens, i)) continue;
+        kept.push(token);
+        continue;
+      }
+
+      if (FILLER_WORDS.has(norm)) {
+        continue;
+      }
+
+      kept.push(token);
+    }
+
+    const text = kept.join(" ").replace(/\s+/g, " ").trim();
+    if (!text) continue;
+
+    out.push({
+      start: seg.start,
+      end: seg.end,
+      text,
+    });
+  }
+
+  return out;
 }
 
 function isHttpUrl(value: string) {
@@ -119,16 +192,14 @@ async function transcribeAudio(audioPath: string) {
   const buffer = await fs.readFile(audioPath);
   const form = new FormData();
   form.append(
-    "audio",
+    "file",
     new Blob([buffer], { type: "audio/wav" }),
     path.basename(audioPath),
   );
   if (ELEVENLABS_LANGUAGE_CODE) {
     form.append("language_code", ELEVENLABS_LANGUAGE_CODE);
   }
-  if (ELEVENLABS_STT_MODEL_ID) {
-    form.append("model_id", ELEVENLABS_STT_MODEL_ID);
-  }
+  form.append("model_id", ELEVENLABS_STT_MODEL_ID || "scribe_v1");
   const res = await fetch(ELEVENLABS_STT_URL, {
     method: "POST",
     headers: {

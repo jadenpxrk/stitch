@@ -12,8 +12,16 @@
  */
 
 import { CapabilityName, ToolResult, ToolHandler } from "./types";
-import { applyIntroTrim } from "./sessionStore";
-import { generateCaptionsForSession } from "./captions";
+import {
+  applyIntroTrim,
+  computeEditPlan,
+  generateCaptions,
+  getSessionMutable,
+  setUserFix,
+  stopSession,
+} from "./sessionStore";
+import { ensureRecordingFile, renderFinalMp4 } from "./renderPipeline";
+import { persistPlan } from "./persistence";
 
 // Input types for each capability
 export interface TrimIntroInput {
@@ -47,6 +55,7 @@ export interface GenerateCaptionsInput {
 
 export interface ExportVideoInput {
   sessionId: string;
+  recordingUrl?: string;
   format?: "mp4" | "webm" | "mov";
   quality?: "draft" | "standard" | "high";
 }
@@ -172,32 +181,26 @@ registerHandler<TrimIntroInput, TrimIntroOutput>(
 registerHandler<GenerateCaptionsInput, GenerateCaptionsOutput>(
   "generate_captions",
   async (input) => {
-    try {
-      const vttPath = await generateCaptionsForSession(
-        input.sessionId,
-        input.recordingUrl
-      );
-      return {
-        success: true,
-        data: { vttPath },
-      };
-    } catch (error) {
+    const state = await generateCaptions(input.sessionId, input.recordingUrl);
+    if (!state) return { success: false, error: "Session not found" };
+    if (state.captions?.status !== "ready" || !state.captions.vttPath) {
       return {
         success: false,
-        error: error instanceof Error ? error.message : "Caption generation failed",
+        error: state.captions?.error || "Caption generation failed",
       };
     }
+    return { success: true, data: { vttPath: state.captions.vttPath } };
   }
 );
 
-// Placeholder handlers for capabilities that require implementation elsewhere
 registerHandler<StabilizeSegmentInput, StabilizeSegmentOutput>(
   "stabilize_segment",
   async (input) => {
-    // TODO: Implement stabilization via renderPipeline
+    const state = setUserFix(input.sessionId, input.segmentId, "STABILIZE");
+    if (!state) return { success: false, error: "Session or segment not found" };
     return {
-      success: false,
-      error: "Stabilize segment not yet implemented",
+      success: true,
+      data: { segmentId: input.segmentId, method: input.method || "warp" },
     };
   }
 );
@@ -205,10 +208,11 @@ registerHandler<StabilizeSegmentInput, StabilizeSegmentOutput>(
 registerHandler<CutSegmentInput, CutSegmentOutput>(
   "cut_segment",
   async (input) => {
-    // TODO: Implement cut via segment manipulation
+    const state = setUserFix(input.sessionId, input.segmentId, "CUT");
+    if (!state) return { success: false, error: "Session or segment not found" };
     return {
-      success: false,
-      error: "Cut segment not yet implemented",
+      success: true,
+      data: { segmentId: input.segmentId, removed: true },
     };
   }
 );
@@ -216,22 +220,41 @@ registerHandler<CutSegmentInput, CutSegmentOutput>(
 registerHandler<BridgeSegmentsInput, BridgeSegmentsOutput>(
   "bridge_segments",
   async (input) => {
-    // TODO: Implement bridge via segment manipulation
-    return {
-      success: false,
-      error: "Bridge segments not yet implemented",
-    };
+    let bridgedCount = 0;
+    for (const segmentId of input.segmentIds) {
+      const state = setUserFix(input.sessionId, segmentId, "BRIDGE");
+      if (state) bridgedCount += 1;
+    }
+    if (bridgedCount === 0) return { success: false, error: "No segments were bridged" };
+    return { success: true, data: { bridgedCount } };
   }
 );
 
 registerHandler<ExportVideoInput, ExportVideoOutput>(
   "export_video",
   async (input) => {
-    // TODO: Implement export via renderPipeline
-    return {
-      success: false,
-      error: "Export video not yet implemented",
-    };
+    const existing = getSessionMutable(input.sessionId);
+    if (!existing) return { success: false, error: "Session not found" };
+
+    if (existing.status === "running") {
+      await stopSession(existing.id, input.recordingUrl);
+    }
+
+    const state = getSessionMutable(input.sessionId);
+    if (!state) return { success: false, error: "Session not found" };
+
+    const plan = computeEditPlan(state.id);
+    if (!plan) return { success: false, error: "No edit plan available" };
+
+    const { recordingPath } = await ensureRecordingFile(state, input.recordingUrl);
+    const { finalPath, updatedPlan } = await renderFinalMp4({
+      state,
+      plan,
+      recordingPath,
+    });
+    await persistPlan(state.id, updatedPlan);
+
+    return { success: true, data: { outputPath: finalPath, format: "mp4" } };
   }
 );
 

@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
+import { Blob } from "node:buffer";
 import { NextResponse } from "next/server";
 import { CommandError, hasAudio, runFfmpeg, runFfprobe } from "@/lib/ffmpeg";
 
@@ -109,9 +110,156 @@ async function generateThumbnailLocal(inputJpg: string, outJpg: string) {
   );
 }
 
-async function runNanoBanana(inputJpg: string, outJpg: string) {
+function stripInlineComment(value: string) {
+  return value.replace(/\s+#.*$/, "").trim();
+}
+
+function readEnv(name: string, fallback: string) {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const cleaned = stripInlineComment(raw);
+  return cleaned ? cleaned : fallback;
+}
+
+function parseBoolean(value: unknown, fallback: boolean) {
+  if (value == null) return fallback;
+  const cleaned = String(value).trim().toLowerCase();
+  if (["1", "true", "yes", "y", "on"].includes(cleaned)) return true;
+  if (["0", "false", "no", "n", "off"].includes(cleaned)) return false;
+  return fallback;
+}
+
+function parseNumber(value: unknown, fallback: number) {
+  if (value == null) return fallback;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+async function runNanoBananaViaFal(inputJpg: string, outJpg: string) {
+  const falKey = readEnv("FAL_KEY", "");
+  if (!falKey) return false;
+
+  let fal: typeof import("@fal-ai/client").fal;
+  try {
+    ({ fal } = await import("@fal-ai/client"));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`Failed to load @fal-ai/client (${msg}). Ensure dependencies are installed in web/.`);
+  }
+
+  fal.config({ credentials: falKey });
+
+  const endpoint = readEnv("NANO_BANANA_ENDPOINT", "fal-ai/nano-banana-pro/edit");
+  const prompt = readEnv(
+    "NANO_BANANA_PROMPT",
+    "Transform this video frame into a professional, scroll-stopping YouTube thumbnail. Enhance colors and contrast, improve lighting, sharpen details, keep the main subject clear and centered, and make it feel high-quality. Keep it realistic. Do not add text, logos, or watermarks.",
+  );
+
+  const aspectRatio = readEnv("NANO_BANANA_ASPECT_RATIO", "16:9");
+  const resolution = readEnv("NANO_BANANA_RESOLUTION", "1K");
+  const outputFormat = readEnv("NANO_BANANA_OUTPUT_FORMAT", "jpeg");
+  const enableWebSearch = parseBoolean(process.env.NANO_BANANA_ENABLE_WEB_SEARCH, false);
+  const numImages = Math.max(1, Math.min(4, parseNumber(process.env.NANO_BANANA_NUM_IMAGES, 1)));
+
+  const inputBuf = await fs.readFile(inputJpg);
+  const inputBlob = new Blob([inputBuf], { type: "image/jpeg" });
+
+  const result = await fal.subscribe(endpoint, {
+    input: {
+      prompt,
+      image_urls: [inputBlob],
+      num_images: numImages,
+      aspect_ratio: aspectRatio,
+      resolution,
+      output_format: outputFormat,
+      limit_generations: true,
+      enable_web_search: enableWebSearch,
+    },
+    logs: true,
+  });
+
+  const url = result?.data?.images?.[0]?.url;
+  if (!url) throw new Error("fal response missing images[0].url");
+
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Failed to download nano banana output: ${res.status} ${res.statusText}`);
+
+  await fs.mkdir(path.dirname(outJpg), { recursive: true });
+  await fs.writeFile(outJpg, Buffer.from(await res.arrayBuffer()));
+  return true;
+}
+
+async function runThumbnailViaGemini(inputJpg: string, outJpg: string) {
+  const geminiKey = readEnv("GEMINI_API_KEY", "");
+  if (!geminiKey) return false;
+
+  let GoogleGenerativeAI: typeof import("@google/generative-ai").GoogleGenerativeAI;
+  try {
+    ({ GoogleGenerativeAI } = await import("@google/generative-ai"));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`Failed to load @google/generative-ai (${msg}). Ensure dependencies are installed in web/.`);
+  }
+
+  const genAI = new GoogleGenerativeAI(geminiKey);
+  const model = genAI.getGenerativeModel({
+    model: "gemini-2.0-flash-exp",
+    generationConfig: {
+      // @ts-expect-error - responseModalities is a valid option for image generation
+      responseModalities: ["image", "text"],
+    },
+  });
+
+  const prompt = readEnv(
+    "GEMINI_THUMBNAIL_PROMPT",
+    "Transform this video frame into a professional, scroll-stopping YouTube thumbnail. Enhance colors and contrast, improve lighting, sharpen details, keep the main subject clear and centered, and make it feel high-quality. Keep it realistic. Do not add text, logos, or watermarks. Return only the enhanced image.",
+  );
+
+  const inputBuf = await fs.readFile(inputJpg);
+  const base64Image = inputBuf.toString("base64");
+
+  const result = await model.generateContent([
+    prompt,
+    {
+      inlineData: {
+        mimeType: "image/jpeg",
+        data: base64Image,
+      },
+    },
+  ]);
+
+  const response = result.response;
+  const parts = response.candidates?.[0]?.content?.parts;
+
+  if (!parts || parts.length === 0) {
+    throw new Error("Gemini response missing content parts");
+  }
+
+  for (const part of parts) {
+    if ("inlineData" in part && part.inlineData) {
+      const imageData = part.inlineData.data;
+      const imageBuffer = Buffer.from(imageData, "base64");
+      await fs.mkdir(path.dirname(outJpg), { recursive: true });
+      await fs.writeFile(outJpg, imageBuffer);
+      return true;
+    }
+  }
+
+  throw new Error("Gemini response did not contain an image");
+}
+
+type ThumbnailProvider = "fal" | "gemini";
+
+async function runThumbnailGeneration(inputJpg: string, outJpg: string, provider: ThumbnailProvider = "fal") {
+  if (provider === "gemini") {
+    return await runThumbnailViaGemini(inputJpg, outJpg);
+  }
+
+  // Default: try fal (Nano Banana Pro)
   const cmdRaw = process.env.NANO_BANANA_CMD;
-  if (!cmdRaw) return false;
+  if (!cmdRaw) {
+    return await runNanoBananaViaFal(inputJpg, outJpg);
+  }
   const cmd = cmdRaw.replace(/\s+#.*$/, "").trim();
   if (!cmd) return false;
 
@@ -242,6 +390,8 @@ export async function POST(request: Request) {
 
   const frames = parseFrames(formData.get("frames"));
   const clips = parseClips(formData.get("clips"));
+  const providerRaw = formData.get("provider");
+  const provider: ThumbnailProvider = providerRaw === "gemini" ? "gemini" : "fal";
 
   const analysisId = makeAnalysisId();
   const analysisDir = path.join(ANALYSIS_ROOT, analysisId);
@@ -265,14 +415,14 @@ export async function POST(request: Request) {
         const outCandidate = path.join(framesDir, `${baseName}.jpg`);
         const outGenerated = path.join(thumbsDir, `thumb_${String(i).padStart(2, "0")}.jpg`);
         await extractFrame(inputPath, safeTs, outCandidate);
-        let usedNanoBanana = false;
+        let usedProvider = false;
         try {
-          usedNanoBanana = await runNanoBanana(outCandidate, outGenerated);
+          usedProvider = await runThumbnailGeneration(outCandidate, outGenerated, provider);
         } catch (err) {
-          console.error("NANO_BANANA_CMD failed; falling back to local thumbnail generation.", err);
-          usedNanoBanana = false;
+          console.error(`Thumbnail generation (${provider}) failed; falling back to local.`, err);
+          usedProvider = false;
         }
-        if (!usedNanoBanana) {
+        if (!usedProvider) {
           await generateThumbnailLocal(outCandidate, outGenerated);
         }
         return {

@@ -20,6 +20,8 @@ import { Textarea } from "@/components/ui/textarea";
 import { ToastProvider, toastManager } from "@/components/ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { VideoAgentsPanel } from "@/components/agents/video-agents";
+import { CaptionsNotes } from "@/components/notes/captions-notes";
+import { WoodwidePanel } from "@/components/agents/woodwide-panel";
 import {
   CropIcon,
   FilmIcon,
@@ -481,9 +483,6 @@ export default function Home() {
   const canZoomOut = canEdit && zoom > 0.5;
   const canZoomIn = canEdit && zoom < 4;
 
-  React.useEffect(() => {
-    if (!isBladeMode) setTimelineHoverTime(null);
-  }, [isBladeMode]);
 
   const timelineWidthPx = React.useMemo(() => {
     const base = 120; // px/s
@@ -969,22 +968,31 @@ export default function Home() {
   return (
     <ToastProvider>
       <div className="min-h-screen bg-background text-foreground">
-        <div className="mx-auto flex min-h-screen max-w-7xl flex-col gap-6 px-6 py-8">
+        <div className="flex min-h-screen flex-col gap-6 px-6 py-8">
           {clips.length === 0 ? (
             <div className="fixed right-6 top-6 z-50">
               <ThemeToggle theme={theme} onChange={setTheme} />
             </div>
           ) : (
             <header className="flex flex-wrap items-center justify-between gap-4">
-              <div className="min-w-0">
-                <div className="truncate font-semibold text-lg leading-tight">
-                  {selectedClip?.file.name ?? "Untitled"}
+              <div className="min-w-0 flex items-center gap-6">
+                <div>
+                  <div className="truncate font-semibold text-lg leading-tight">
+                    {selectedClip?.file.name ?? "Untitled"}
+                  </div>
+                  <div className="mt-1 text-muted-foreground text-xs tabular-nums">
+                    {selectedClipIndex >= 0
+                      ? `Clip ${selectedClipIndex + 1} / ${clips.length}`
+                      : `${clips.length} clips`}
+                    {duration > 0 ? ` • ${formatTime(duration)} total` : " • Loading…"}
+                  </div>
                 </div>
-                <div className="mt-1 text-muted-foreground text-xs tabular-nums">
-                  {selectedClipIndex >= 0
-                    ? `Clip ${selectedClipIndex + 1} / ${clips.length}`
-                    : `${clips.length} clips`}
-                  {duration > 0 ? ` • ${formatTime(duration)} total` : " • Loading…"}
+                <div className="text-muted-foreground text-xs tabular-nums">
+                  {duration > 0 ? (
+                    <span>{formatTime(currentTime)} / {formatTime(duration)}</span>
+                  ) : (
+                    "Loading video…"
+                  )}
                 </div>
               </div>
 
@@ -993,23 +1001,6 @@ export default function Home() {
                   <FolderOpenIcon className="size-4" />
                   Add clip
                 </Button>
-                <Tooltip>
-                  <TooltipTrigger
-                    render={
-                      <div className="flex items-center gap-2 text-muted-foreground text-xs">
-                        <span>Fill gaps</span>
-                        <Switch
-                          checked={fillGapsWithBlack}
-                          disabled={hasMultipleSourceFiles}
-                          onCheckedChange={setFillGapsWithBlack}
-                        />
-                      </div> as React.ReactElement<Record<string, unknown>>
-                    }
-                  />
-                  <TooltipContent>
-                    Export timeline gaps as black video + silence.
-                  </TooltipContent>
-                </Tooltip>
                 <Button disabled={!canExport} onClick={exportClip} size="sm" variant="secondary">
                   {isExporting ? "Exporting…" : "Export"}
                 </Button>
@@ -1078,24 +1069,10 @@ export default function Home() {
               </div>
             </main>
           ) : (
-            <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_380px]">
-              <div className="min-h-0 space-y-10">
+            <div className="flex flex-1 flex-col gap-6 min-h-0">
+              <div className="grid flex-1 min-h-0 gap-6 lg:grid-cols-[minmax(0,1fr)_380px]">
+              <div className="min-h-0 space-y-10 overflow-y-auto">
                 <section className="space-y-3">
-                  <div className="flex items-end justify-between gap-4">
-                    <div>
-                      <div className="font-semibold text-sm">Preview</div>
-                      <div className="text-muted-foreground text-xs tabular-nums">
-                        {duration > 0 ? (
-                          <span className="tabular-nums">
-                            {formatTime(currentTime)} / {formatTime(duration)}
-                          </span>
-                        ) : (
-                          "Loading video…"
-                        )}
-                      </div>
-                    </div>
-                  </div>
-
                   <div className="relative overflow-hidden rounded-xl bg-black">
                     <video
                       ref={videoRef}
@@ -1309,205 +1286,17 @@ export default function Home() {
                     </ScrollArea>
                   </div>
                 </section>
-
-                <section className="space-y-4">
-                  <div className="flex items-end justify-between gap-4">
-                    <div>
-                      <div className="font-semibold text-sm">Timeline</div>
-                      <div className="text-muted-foreground text-xs">
-                        Trim start/end, scrub, and zoom.
-                      </div>
-                    </div>
-
-                    <div className="flex items-center gap-2 text-muted-foreground text-sm tabular-nums">
-                      <span>In: {formatTime(trimStart)}</span>
-                      <Separator className="h-4" orientation="vertical" />
-                      <span>Out: {formatTime(effectiveTrimEnd)}</span>
-                    </div>
-                  </div>
-
-                  <div className="grid gap-4">
-                    <div>
-                      <div className="mb-2 flex items-center justify-between text-muted-foreground text-xs">
-                        <span>Trim</span>
-                        <span className="tabular-nums">
-                          {(effectiveTrimEnd - trimStart).toFixed(1)}s selected
-                        </span>
-                      </div>
-                      <Slider
-                        disabled={!canEdit}
-                        max={maxTime}
-                        min={0}
-                        step={0.01}
-                        value={[trimStart, effectiveTrimEnd]}
-                        onValueChange={(value) => {
-                          if (!Array.isArray(value)) return;
-                          const [a, b] = value;
-                          const nextStart = clamp(a, 0, duration);
-                          const nextEnd = clamp(b, 0, duration);
-                          const orderedStart = Math.min(nextStart, nextEnd);
-                          const orderedEnd = Math.max(nextStart, nextEnd);
-                          updateTrim(orderedStart, orderedEnd);
-                          if (currentTime < orderedStart) seek(orderedStart);
-                          if (currentTime > orderedEnd) seek(Math.max(0, orderedEnd - 0.001));
-                        }}
-                      />
-                    </div>
-
-                    <div>
-                      <div className="mb-2 flex items-center justify-between text-muted-foreground text-xs">
-                        <span>Playhead</span>
-                        <span className="tabular-nums">{formatTime(currentTime)}</span>
-                      </div>
-                      <Slider
-                        disabled={!canEdit}
-                        max={maxTime}
-                        min={0}
-                        step={0.01}
-                        value={[currentTime]}
-                        onValueChange={(value) => {
-                          const next = Array.isArray(value) ? value[0] : value;
-                          seek(next);
-                        }}
-                      />
-                    </div>
-
-                    <div className="overflow-hidden rounded-xl border bg-muted/40">
-                      <ScrollArea scrollbarGutter>
-	                        <div
-                          ref={timelineTrackRef}
-	                          className={`relative h-18 select-none ${isBladeMode ? "cursor-crosshair" : "cursor-pointer"}`}
-	                          onPointerDown={(e) => {
-	                            if (!duration || !canEdit) return;
-	                            const rect = e.currentTarget.getBoundingClientRect();
-                            const x = e.clientX - rect.left;
-                            const ratio = clamp(x / rect.width, 0, 1);
-                            const t = ratio * duration;
-                            if (isBladeMode) {
-                              splitClipAt(t);
-                              return;
-                            }
-                            seek(t);
-                            if (!selectedClip) return;
-                            const file = selectedClip.file;
-                            const candidate = clips.find((c) => {
-                              if (c.file !== file) return false;
-                              const end = c.out > 0 ? c.out : duration;
-                              return t >= c.in && t <= end;
-                            });
-                            if (candidate) setSelectedClipId(candidate.id);
-                          }}
-                          onPointerLeave={() => setTimelineHoverTime(null)}
-                          onPointerMove={(e) => {
-                            if (!duration || !isBladeMode) return;
-                            const rect = e.currentTarget.getBoundingClientRect();
-                            const x = e.clientX - rect.left;
-                            const ratio = clamp(x / rect.width, 0, 1);
-                            setTimelineHoverTime(ratio * duration);
-                          }}
-                          role="presentation"
-                          style={{
-                            width: timelineWidthPx,
-                            backgroundImage:
-                              "linear-gradient(to right, color-mix(in srgb, var(--foreground) 6%, transparent) 1px, transparent 1px)",
-                            backgroundSize: `${Math.max(24, Math.round(60 * zoom))}px 100%`,
-                          }}
-                        >
-                          {canEdit && selectedClip && duration > 0 && (
-                            <div className="absolute inset-y-3 left-0 right-0">
-                              {clips
-                                .filter((c) => c.file === selectedClip.file)
-                                .slice()
-                                .sort((a, b) => a.in - b.in)
-                                .map((clip) => {
-                                  const start = clamp(clip.in, 0, duration);
-                                  const end = clamp(clip.out > 0 ? clip.out : duration, 0, duration);
-                                  const orderedStart = Math.min(start, end);
-                                  const orderedEnd = Math.max(start, end);
-                                  if (orderedEnd <= orderedStart) return null;
-
-                                  const leftPx = (orderedStart / duration) * timelineWidthPx;
-                                  const rightPx = (orderedEnd / duration) * timelineWidthPx;
-                                  const widthPx = rightPx - leftPx;
-                                  const gapPx = 4;
-                                  const insetLeftPx = leftPx + gapPx / 2;
-                                  const insetWidthPx = Math.max(0, widthPx - gapPx);
-                                  if (insetWidthPx <= 0) return null;
-
-                                  const isSelected = clip.id === selectedClipId;
-                                  return (
-                                    <div
-                                      key={clip.id}
-                                      className={`group absolute inset-y-0 rounded-lg border bg-warning/8 shadow-xs/5 transition-[box-shadow,border-color] before:pointer-events-none before:absolute before:inset-0 before:rounded-[calc(var(--radius-lg)-1px)] before:shadow-[inset_0_1px_0_rgba(255,255,255,0.35)] ${isSelected ? "z-10 border-warning/56 ring-2 ring-warning/16" : "z-0 border-warning/32"} dark:bg-warning/16 dark:before:shadow-[inset_0_1px_0_rgba(255,255,255,0.18)]`}
-                                      style={{ left: `${insetLeftPx}px`, width: `${insetWidthPx}px` }}
-                                    >
-                                      {!isBladeMode && canEdit && (
-                                        <>
-                                          <div
-                                            className={`absolute inset-y-0 left-0 w-2 touch-none cursor-ew-resize opacity-0 transition-opacity group-hover:opacity-100 ${isSelected || trimmingClipId === clip.id ? "opacity-100" : ""}`}
-                                            onPointerCancel={onPointerEndClipTrimHandle}
-                                            onPointerDown={onPointerDownClipTrimHandle(clip.id, "start")}
-                                            onPointerMove={onPointerMoveClipTrimHandle}
-                                            onPointerUp={onPointerEndClipTrimHandle}
-                                            role="presentation"
-                                          >
-                                            <div className="absolute inset-y-2 left-1/2 w-px -translate-x-1/2 rounded bg-warning/70" />
-                                          </div>
-                                          <div
-                                            className={`absolute inset-y-0 right-0 w-2 touch-none cursor-ew-resize opacity-0 transition-opacity group-hover:opacity-100 ${isSelected || trimmingClipId === clip.id ? "opacity-100" : ""}`}
-                                            onPointerCancel={onPointerEndClipTrimHandle}
-                                            onPointerDown={onPointerDownClipTrimHandle(clip.id, "end")}
-                                            onPointerMove={onPointerMoveClipTrimHandle}
-                                            onPointerUp={onPointerEndClipTrimHandle}
-                                            role="presentation"
-                                          >
-                                            <div className="absolute inset-y-2 left-1/2 w-px -translate-x-1/2 rounded bg-warning/70" />
-                                          </div>
-                                        </>
-                                      )}
-                                    </div>
-                                  );
-                                })}
-                            </div>
-                          )}
-                          <div
-                            className="pointer-events-none absolute inset-y-0 z-20 w-px bg-primary"
-                            style={{ left: `${playheadPx}px` }}
-                          />
-                          {isBladeMode && timelineHoverPx != null && timelineHoverTime != null && (
-                            <>
-                              <div
-                                className="pointer-events-none absolute inset-y-0 z-30 w-px bg-destructive"
-                                style={{ left: `${timelineHoverPx}px` }}
-                              />
-                              <div
-                                className="pointer-events-none absolute bottom-2 z-30 -translate-x-1/2 rounded-md bg-background/80 px-1.5 py-0.5 text-xs text-foreground tabular-nums shadow"
-                                style={{ left: `${timelineHoverPx}px` }}
-                              >
-                                {formatTime(timelineHoverTime)}
-                              </div>
-                            </>
-                          )}
-                          <div className="pointer-events-none absolute bottom-2 left-2 right-2 z-20 flex items-center justify-between text-muted-foreground text-xs tabular-nums">
-                            <span>0:00.0</span>
-                            <span>{formatTime(duration)}</span>
-                          </div>
-                        </div>
-                      </ScrollArea>
-                    </div>
-                  </div>
-                </section>
               </div>
 
-              <aside className="min-h-0 lg:pl-6 max-lg:pt-6">
-                <div className="flex flex-col gap-4">
-                  <div>
-                    <div className="font-semibold text-sm">Agents</div>
-                    <div className="text-muted-foreground text-xs">
-                      Run specialized agents to generate assets and suggestions.
-                    </div>
+              <aside className="min-h-0 overflow-hidden lg:pl-6 max-lg:pt-6 flex flex-col">
+                <div className="shrink-0">
+                  <div className="font-semibold text-sm">Agents</div>
+                  <div className="text-muted-foreground text-xs">
+                    Run specialized agents to generate assets and suggestions.
                   </div>
+                </div>
 
+                <ScrollArea className="flex-1 mt-4" scrollbarGutter>
                   <Tabs defaultValue="copilot">
                     <TabsList>
                       <TabsTrigger value="copilot">
@@ -1531,28 +1320,239 @@ export default function Home() {
                           Generate edit plan (coming soon)
                         </Button>
                         <div className="text-muted-foreground text-xs">
-                          Tip: we’ll surface suggestions here and apply them to the timeline.
+                          Tip: we&apos;ll surface suggestions here and apply them to the timeline.
                         </div>
                       </div>
                     </TabsContent>
 
-                    <TabsContent className="mt-4" value="agents">
-                      <VideoAgentsPanel
-                        file={selectedFile}
-                        durationSeconds={duration}
-                        onSelectThumbnail={(url) => setPosterUrl(url)}
-                      />
+                    <TabsContent className="mt-4" value="agents" keepMounted>
+                      <div className="flex flex-col gap-4">
+                        <VideoAgentsPanel
+                          file={selectedFile}
+                          durationSeconds={duration}
+                          onSelectThumbnail={(url) => setPosterUrl(url)}
+                        />
+                        <Separator />
+                        <WoodwidePanel />
+                      </div>
                     </TabsContent>
 
                     <TabsContent className="mt-4" value="notes">
-                      <div className="rounded-xl border bg-muted/40 p-4 text-sm text-muted-foreground">
-                        This area can show transcripts, detected chapters, suggested cuts,
-                        and export options.
-                      </div>
+                      <CaptionsNotes file={selectedFile} />
                     </TabsContent>
                   </Tabs>
-                </div>
+                </ScrollArea>
               </aside>
+            </div>
+
+            <section className="space-y-4">
+              <div className="flex items-end justify-between gap-4">
+                <div>
+                  <div className="font-semibold text-sm">Timeline</div>
+                  <div className="text-muted-foreground text-xs">
+                    Trim start/end, scrub, and zoom.
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-4">
+                  <Tooltip>
+                    <TooltipTrigger
+                      render={
+                        <div className="flex items-center gap-2 text-muted-foreground text-xs">
+                          <span>Fill gaps</span>
+                          <Switch
+                            checked={fillGapsWithBlack}
+                            disabled={hasMultipleSourceFiles}
+                            onCheckedChange={setFillGapsWithBlack}
+                          />
+                        </div> as React.ReactElement<Record<string, unknown>>
+                      }
+                    />
+                    <TooltipContent>
+                      Export timeline gaps as black video + silence.
+                    </TooltipContent>
+                  </Tooltip>
+                  <div className="flex items-center gap-2 text-muted-foreground text-sm tabular-nums">
+                    <span>In: {formatTime(trimStart)}</span>
+                    <Separator className="h-4" orientation="vertical" />
+                    <span>Out: {formatTime(effectiveTrimEnd)}</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid gap-4">
+                <div>
+                  <div className="mb-2 flex items-center justify-between text-muted-foreground text-xs">
+                    <span>Trim</span>
+                    <span className="tabular-nums">
+                      {(effectiveTrimEnd - trimStart).toFixed(1)}s selected
+                    </span>
+                  </div>
+                  <Slider
+                    disabled={!canEdit}
+                    max={maxTime}
+                    min={0}
+                    step={0.01}
+                    value={[trimStart, effectiveTrimEnd]}
+                    onValueChange={(value) => {
+                      if (!Array.isArray(value)) return;
+                      const [a, b] = value;
+                      const nextStart = clamp(a, 0, duration);
+                      const nextEnd = clamp(b, 0, duration);
+                      const orderedStart = Math.min(nextStart, nextEnd);
+                      const orderedEnd = Math.max(nextStart, nextEnd);
+                      updateTrim(orderedStart, orderedEnd);
+                      if (currentTime < orderedStart) seek(orderedStart);
+                      if (currentTime > orderedEnd) seek(Math.max(0, orderedEnd - 0.001));
+                    }}
+                  />
+                </div>
+
+                <div>
+                  <div className="mb-2 flex items-center justify-between text-muted-foreground text-xs">
+                    <span>Playhead</span>
+                    <span className="tabular-nums">{formatTime(currentTime)}</span>
+                  </div>
+                  <Slider
+                    disabled={!canEdit}
+                    max={maxTime}
+                    min={0}
+                    step={0.01}
+                    value={[currentTime]}
+                    onValueChange={(value) => {
+                      const next = Array.isArray(value) ? value[0] : value;
+                      seek(next);
+                    }}
+                  />
+                </div>
+
+                <div className="min-w-0">
+                  <div className="mb-1 flex items-center justify-between text-muted-foreground text-xs tabular-nums">
+                    <span>0:00.0</span>
+                    <span>{formatTime(duration)}</span>
+                  </div>
+                  <div className="overflow-hidden rounded-xl border bg-muted/40">
+                    <ScrollArea scrollbarGutter>
+                      <div
+                        ref={timelineTrackRef}
+                        className={`relative h-18 select-none ${isBladeMode ? "cursor-crosshair" : "cursor-pointer"}`}
+                        onPointerDown={(e) => {
+                          if (!duration || !canEdit) return;
+                          const rect = e.currentTarget.getBoundingClientRect();
+                          const x = e.clientX - rect.left;
+                          const ratio = clamp(x / rect.width, 0, 1);
+                          const t = ratio * duration;
+                          if (isBladeMode) {
+                            splitClipAt(t);
+                            return;
+                          }
+                          seek(t);
+                          if (!selectedClip) return;
+                          const file = selectedClip.file;
+                          const candidate = clips.find((c) => {
+                            if (c.file !== file) return false;
+                            const end = c.out > 0 ? c.out : duration;
+                            return t >= c.in && t <= end;
+                          });
+                          if (candidate) setSelectedClipId(candidate.id);
+                        }}
+                        onPointerLeave={() => setTimelineHoverTime(null)}
+                        onPointerMove={(e) => {
+                          if (!duration) return;
+                          const rect = e.currentTarget.getBoundingClientRect();
+                          const x = e.clientX - rect.left;
+                          const ratio = clamp(x / rect.width, 0, 1);
+                          setTimelineHoverTime(ratio * duration);
+                        }}
+                        role="presentation"
+                        style={{
+                          width: timelineWidthPx,
+                          backgroundImage:
+                            "linear-gradient(to right, color-mix(in srgb, var(--foreground) 6%, transparent) 1px, transparent 1px)",
+                          backgroundSize: `${Math.max(24, Math.round(60 * zoom))}px 100%`,
+                        }}
+                      >
+                        {canEdit && selectedClip && duration > 0 && (
+                          <div className="absolute inset-y-3 left-0 right-0">
+                            {clips
+                              .filter((c) => c.file === selectedClip.file)
+                              .slice()
+                              .sort((a, b) => a.in - b.in)
+                              .map((clip) => {
+                                const start = clamp(clip.in, 0, duration);
+                                const end = clamp(clip.out > 0 ? clip.out : duration, 0, duration);
+                                const orderedStart = Math.min(start, end);
+                                const orderedEnd = Math.max(start, end);
+                                if (orderedEnd <= orderedStart) return null;
+
+                                const leftPx = (orderedStart / duration) * timelineWidthPx;
+                                const rightPx = (orderedEnd / duration) * timelineWidthPx;
+                                const widthPx = rightPx - leftPx;
+                                const gapPx = 4;
+                                const insetLeftPx = leftPx + gapPx / 2;
+                                const insetWidthPx = Math.max(0, widthPx - gapPx);
+                                if (insetWidthPx <= 0) return null;
+
+                                const isSelected = clip.id === selectedClipId;
+                                return (
+                                  <div
+                                    key={clip.id}
+                                    className={`group absolute inset-y-0 rounded-lg border bg-warning/8 shadow-xs/5 transition-[box-shadow,border-color] before:pointer-events-none before:absolute before:inset-0 before:rounded-[calc(var(--radius-lg)-1px)] before:shadow-[inset_0_1px_0_rgba(255,255,255,0.35)] ${isSelected ? "z-10 border-warning/56 ring-2 ring-warning/16" : "z-0 border-warning/32"} dark:bg-warning/16 dark:before:shadow-[inset_0_1px_0_rgba(255,255,255,0.18)]`}
+                                    style={{ left: `${insetLeftPx}px`, width: `${insetWidthPx}px` }}
+                                  >
+                                    {!isBladeMode && canEdit && (
+                                      <>
+                                        <div
+                                          className={`absolute inset-y-0 left-0 w-2 touch-none cursor-ew-resize opacity-0 transition-opacity group-hover:opacity-100 ${isSelected || trimmingClipId === clip.id ? "opacity-100" : ""}`}
+                                          onPointerCancel={onPointerEndClipTrimHandle}
+                                          onPointerDown={onPointerDownClipTrimHandle(clip.id, "start")}
+                                          onPointerMove={onPointerMoveClipTrimHandle}
+                                          onPointerUp={onPointerEndClipTrimHandle}
+                                          role="presentation"
+                                        >
+                                          <div className="absolute inset-y-2 left-1/2 w-px -translate-x-1/2 rounded bg-warning/70" />
+                                        </div>
+                                        <div
+                                          className={`absolute inset-y-0 right-0 w-2 touch-none cursor-ew-resize opacity-0 transition-opacity group-hover:opacity-100 ${isSelected || trimmingClipId === clip.id ? "opacity-100" : ""}`}
+                                          onPointerCancel={onPointerEndClipTrimHandle}
+                                          onPointerDown={onPointerDownClipTrimHandle(clip.id, "end")}
+                                          onPointerMove={onPointerMoveClipTrimHandle}
+                                          onPointerUp={onPointerEndClipTrimHandle}
+                                          role="presentation"
+                                        >
+                                          <div className="absolute inset-y-2 left-1/2 w-px -translate-x-1/2 rounded bg-warning/70" />
+                                        </div>
+                                      </>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                          </div>
+                        )}
+                        <div
+                          className="pointer-events-none absolute inset-y-0 z-20 w-px bg-primary"
+                          style={{ left: `${playheadPx}px` }}
+                        />
+                        {timelineHoverPx != null && timelineHoverTime != null && (
+                          <>
+                            <div
+                              className={`pointer-events-none absolute inset-y-0 z-30 w-px ${isBladeMode ? "bg-destructive" : "bg-foreground/30"}`}
+                              style={{ left: `${timelineHoverPx}px` }}
+                            />
+                            <div
+                              className={`pointer-events-none absolute bottom-2 z-30 -translate-x-1/2 rounded-md px-1.5 py-0.5 text-xs tabular-nums shadow ${isBladeMode ? "bg-background/80 text-foreground" : "bg-background/60 text-foreground/70"}`}
+                              style={{ left: `${timelineHoverPx}px` }}
+                            >
+                              {formatTime(timelineHoverTime)}
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    </ScrollArea>
+                  </div>
+                </div>
+              </div>
+            </section>
             </div>
           )}
         </div>

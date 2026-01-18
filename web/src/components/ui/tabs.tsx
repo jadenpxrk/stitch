@@ -67,11 +67,16 @@ function TabsTab({ className, ...props }: TabsPrimitive.Tab.Props) {
   );
 }
 
-function TabsPanel({ className, ...props }: TabsPrimitive.Panel.Props) {
+function TabsPanel({
+  className,
+  keepMounted,
+  ...props
+}: TabsPrimitive.Panel.Props & { keepMounted?: boolean }) {
   return (
     <TabsPrimitive.Panel
       className={cn("flex-1 outline-none", className)}
       data-slot="tabs-content"
+      keepMounted={keepMounted}
       {...props}
     />
   );

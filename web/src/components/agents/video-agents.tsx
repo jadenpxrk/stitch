@@ -15,8 +15,11 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
+
+type ThumbnailProvider = "fal" | "gemini";
 
 type ThumbnailCandidate = {
   timeSeconds: number;
@@ -34,6 +37,12 @@ type PeakTick = {
   hookText: string | null;
   suggestedStart: number | null;
   suggestedEnd: number | null;
+};
+
+type VisionParseContext = {
+  windowIndex: number;
+  windowEndSeconds: number;
+  playbackSeconds: number;
 };
 
 type ExtractedThumbnail = {
@@ -345,6 +354,14 @@ function normalizeClipRange(start: number, end: number, durationSeconds: number)
   return { start: s, end: e };
 }
 
+function clipRangesNear(a: { start: number; end: number }, b: { start: number; end: number }) {
+  const aCenter = (a.start + a.end) / 2;
+  const bCenter = (b.start + b.end) / 2;
+  const centerDelta = Math.abs(aCenter - bCenter);
+  const overlap = Math.min(a.end, b.end) - Math.max(a.start, b.start);
+  return overlap >= 1 || centerDelta <= 30;
+}
+
 function buildPeakClips(ticks: PeakTick[], durationSeconds: number) {
   const windowLen = 3;
   const threshold = 70;
@@ -389,13 +406,17 @@ function buildPeakClips(ticks: PeakTick[], durationSeconds: number) {
   for (const seg of merged) {
     const top = seg.top;
 
-    const suggested =
+    const derived = normalizeClipRange(seg.start, seg.end, durationSeconds);
+
+    const normalizedSuggested =
       top.suggestedStart != null && top.suggestedEnd != null
         ? normalizeClipRange(top.suggestedStart, top.suggestedEnd, durationSeconds)
         : null;
 
-    const derived = normalizeClipRange(seg.start, seg.end, durationSeconds);
-    const picked = suggested ?? derived;
+    const suggested =
+      normalizedSuggested && derived && clipRangesNear(normalizedSuggested, derived) ? normalizedSuggested : null;
+
+    const picked = suggested ?? derived ?? normalizedSuggested;
     if (!picked) continue;
 
     clips.push({
@@ -408,7 +429,15 @@ function buildPeakClips(ticks: PeakTick[], durationSeconds: number) {
   }
 
   clips.sort((a, b) => (b.peakScore ?? 0) - (a.peakScore ?? 0));
-  return clips.slice(0, 5);
+
+  const unique: ClipExtractRequest[] = [];
+  const eps = 0.25;
+  for (const clip of clips) {
+    const dup = unique.some((u) => Math.abs(u.start - clip.start) <= eps && Math.abs(u.end - clip.end) <= eps);
+    if (!dup) unique.push(clip);
+  }
+
+  return unique.slice(0, 5);
 }
 
 async function runVision<T>(opts: {
@@ -417,7 +446,7 @@ async function runVision<T>(opts: {
   processing: { clip_length_seconds: number; delay_seconds: number; fps: number; sampling_ratio: number };
   prompt: string;
   outputSchema: Record<string, unknown>;
-  parse: (payload: unknown, elapsedSeconds: number) => T | null;
+  parse: (payload: unknown, ctx: VisionParseContext) => T | null;
   onProgress?: (elapsedSeconds: number) => void;
   signal?: AbortSignal;
 }) {
@@ -430,6 +459,7 @@ async function runVision<T>(opts: {
   const timing = await prepareTimingVideo(opts.file, opts.signal);
 
   try {
+    let windowIndex = 0;
     vision = new RealtimeVision({
       apiUrl,
       apiKey,
@@ -439,11 +469,18 @@ async function runVision<T>(opts: {
       prompt: opts.prompt,
       outputSchema: opts.outputSchema,
       onResult: (result) => {
-        const elapsedSeconds = timing.video.currentTime;
-        opts.onProgress?.(elapsedSeconds);
+        const playbackSeconds = timing.video.currentTime;
+        opts.onProgress?.(playbackSeconds);
+
+        const computedEnd = windowIndex * opts.processing.delay_seconds + opts.processing.clip_length_seconds;
+        const windowEndSeconds =
+          opts.durationSeconds > 0 ? clamp(computedEnd, 0, opts.durationSeconds) : Math.max(0, computedEnd);
+
         const json = getResultJson(result);
-        const parsed = opts.parse(json, elapsedSeconds);
+        const parsed = opts.parse(json, { windowIndex, windowEndSeconds, playbackSeconds });
         if (parsed) results.push(parsed);
+
+        windowIndex += 1;
       },
     });
 
@@ -469,12 +506,16 @@ async function extractAssets(opts: {
   file: File;
   frameTimes?: number[];
   clips?: ClipExtractRequest[];
+  provider?: ThumbnailProvider;
   signal?: AbortSignal;
 }) {
   const fd = new FormData();
   fd.append("file", opts.file);
   fd.append("frames", JSON.stringify(opts.frameTimes ?? []));
   fd.append("clips", JSON.stringify(opts.clips ?? []));
+  if (opts.provider) {
+    fd.append("provider", opts.provider);
+  }
 
   const res = await fetch("/api/analysis/extract", { method: "POST", body: fd, signal: opts.signal });
   if (!res.ok) {
@@ -500,6 +541,7 @@ function ThumbnailAgent({
   const [result, setResult] = React.useState<ThumbnailResult | null>(null);
   const [selectedThumb, setSelectedThumb] = React.useState<string | null>(null);
   const [previewThumb, setPreviewThumb] = React.useState<ThumbnailItem | null>(null);
+  const [provider, setProvider] = React.useState<ThumbnailProvider>("gemini");
   const abortRef = React.useRef<AbortController | null>(null);
 
   React.useEffect(() => {
@@ -537,14 +579,14 @@ function ThumbnailAgent({
         outputSchema: thumbnailSchema,
         signal: abort.signal,
         onProgress: (e) => setElapsed(e),
-        parse: (payload, elapsedSeconds) => {
+        parse: (payload, ctx) => {
           const obj = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : null;
           if (!obj) return null;
           const score = Number(obj.thumbnail_score);
           const ts = Number(obj.timestamp_seconds);
           const reasoning = typeof obj.reasoning === "string" ? obj.reasoning : "";
           if (!Number.isFinite(score)) return null;
-          const timeSeconds = Number.isFinite(ts) ? ts : elapsedSeconds;
+          const timeSeconds = Number.isFinite(ts) ? ts : ctx.windowEndSeconds;
           return {
             score,
             timeSeconds,
@@ -562,7 +604,7 @@ function ThumbnailAgent({
       setStatus("extracting");
       setElapsed(0);
 
-      const data = await extractAssets({ file, frameTimes, clips: [], signal: abort.signal });
+      const data = await extractAssets({ file, frameTimes, clips: [], provider, signal: abort.signal });
 
       const mergedThumbs = data.thumbnails.map((t, idx) => {
         const meta = top[idx];
@@ -619,6 +661,24 @@ function ThumbnailAgent({
             Cancel
           </Button>
         </div>
+      </div>
+
+      <div className="flex items-center gap-2">
+        <Select
+          value={provider}
+          onValueChange={(val) => setProvider(val as ThumbnailProvider)}
+          disabled={status === "running" || status === "extracting"}
+        >
+          <SelectTrigger size="sm" className="w-[160px]">
+            <SelectValue placeholder="Select provider">
+              {provider === "gemini" ? "Gemini Flash" : "Nano Banana Pro"}
+            </SelectValue>
+          </SelectTrigger>
+          <SelectPopup>
+            <SelectItem value="gemini">Gemini Flash</SelectItem>
+            <SelectItem value="fal">Nano Banana Pro</SelectItem>
+          </SelectPopup>
+        </Select>
       </div>
 
       {(status === "running" || status === "extracting") && (
@@ -697,13 +757,28 @@ function ThumbnailAgent({
 
           <DialogPanel scrollFade={false}>
             {previewThumb && (
-              <div className="space-y-3">
-                <div className="overflow-hidden rounded-lg bg-black">
-                  <img
-                    alt="Generated thumbnail preview"
-                    className="max-h-[70vh] w-full object-contain"
-                    src={previewThumb.generatedUrl}
-                  />
+              <div className="space-y-4">
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-2">
+                    <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Original Frame</div>
+                    <div className="overflow-hidden rounded-lg bg-black">
+                      <img
+                        alt="Original frame"
+                        className="aspect-video w-full object-contain"
+                        src={previewThumb.candidateUrl}
+                      />
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <div className="text-xs font-medium text-muted-foreground uppercase tracking-wide">Thumbnailified</div>
+                    <div className="overflow-hidden rounded-lg bg-black">
+                      <img
+                        alt="Generated thumbnail"
+                        className="aspect-video w-full object-contain"
+                        src={previewThumb.generatedUrl}
+                      />
+                    </div>
+                  </div>
                 </div>
 
                 {previewThumb.reasoning && (
@@ -713,19 +788,19 @@ function ThumbnailAgent({
                 <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
                   <a
                     className="underline underline-offset-4"
-                    href={previewThumb.generatedUrl}
-                    rel="noreferrer"
-                    target="_blank"
-                  >
-                    Open image
-                  </a>
-                  <a
-                    className="underline underline-offset-4"
                     href={previewThumb.candidateUrl}
                     rel="noreferrer"
                     target="_blank"
                   >
-                    Open source frame
+                    Open original
+                  </a>
+                  <a
+                    className="underline underline-offset-4"
+                    href={previewThumb.generatedUrl}
+                    rel="noreferrer"
+                    target="_blank"
+                  >
+                    Open thumbnail
                   </a>
                 </div>
               </div>
@@ -787,7 +862,7 @@ function ClipScoutAgent({
         outputSchema: peakClipSchema,
         signal: abort.signal,
         onProgress: (e) => setElapsed(e),
-        parse: (payload, elapsedSeconds) => {
+        parse: (payload, ctx) => {
           const obj = payload && typeof payload === "object" ? (payload as Record<string, unknown>) : null;
           if (!obj) return null;
           const peakScore = Number(obj.peak_score);
@@ -800,7 +875,7 @@ function ClipScoutAgent({
 
           return {
             peakScore,
-            windowEndSeconds: elapsedSeconds,
+            windowEndSeconds: ctx.windowEndSeconds,
             clipType,
             hookText,
             suggestedStart,
