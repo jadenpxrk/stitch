@@ -19,10 +19,12 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { ToastProvider, toastManager } from "@/components/ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { OvershootAnalyzer } from "@/components/overshoot/overshoot-analyzer";
 import {
   CropIcon,
   FilmIcon,
   FolderOpenIcon,
+  GripVerticalIcon,
   MoonIcon,
   PauseIcon,
   PlayIcon,
@@ -45,7 +47,21 @@ type CropRect = {
   h: number;
 };
 
+type Clip = {
+  id: string;
+  file: File;
+  in: number;
+  out: number;
+  crop: CropRect;
+};
+
 const DEFAULT_CROP: CropRect = { x: 0, y: 0, w: 1, h: 1 };
+const SPLIT_MIN_GAP_S = 0.05;
+
+type ClipDropTarget = {
+  targetId: string;
+  position: "before" | "after";
+};
 
 function formatTime(seconds: number) {
   const s = Math.max(0, seconds);
@@ -61,6 +77,38 @@ function clamp(n: number, min: number, max: number) {
 
 function isDefaultCrop(crop: CropRect) {
   return crop.x === 0 && crop.y === 0 && crop.w === 1 && crop.h === 1;
+}
+
+function isMp4(file: File) {
+  return file.type === "video/mp4" || file.name.toLowerCase().endsWith(".mp4");
+}
+
+function makeClipId() {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return `clip_${crypto.randomUUID()}`;
+  }
+  return `clip_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function moveClip(
+  prev: Clip[],
+  draggedId: string,
+  targetId: string,
+  position: ClipDropTarget["position"],
+) {
+  if (draggedId === targetId) return prev;
+  const fromIndex = prev.findIndex((c) => c.id === draggedId);
+  const targetIndex = prev.findIndex((c) => c.id === targetId);
+  if (fromIndex < 0 || targetIndex < 0) return prev;
+
+  const insertBase = position === "before" ? targetIndex : targetIndex + 1;
+  const insertAt = fromIndex < insertBase ? insertBase - 1 : insertBase;
+  if (insertAt === fromIndex) return prev;
+
+  const next = [...prev];
+  const [dragged] = next.splice(fromIndex, 1);
+  next.splice(insertAt, 0, dragged);
+  return next;
 }
 
 type CropHandle = "move" | "nw" | "ne" | "sw" | "se";
@@ -230,16 +278,19 @@ function IconButton({
   disabled,
   onClick,
   variant = "outline",
+  pressed,
   children,
 }: {
   label: string;
   disabled?: boolean;
   onClick?: () => void;
   variant?: React.ComponentProps<typeof Button>["variant"];
+  pressed?: boolean;
   children: React.ReactNode;
 }) {
   const button = (
     <Button
+      aria-pressed={pressed}
       disabled={disabled}
       onClick={onClick}
       size="icon-sm"
@@ -279,41 +330,134 @@ function ThemeToggle({
 }
 
 export default function Home() {
-  const [sessionId, setSessionId] = useState<string>("demo-session");
-  const [source, setSource] = useState<string>("webcam");
-  const [recordingUrl, setRecordingUrl] = useState<string>("");
-  const [state, setState] = useState<SessionState | null>(null);
-  const [exportPlan, setExportPlan] = useState<EditPlan | null>(null);
-  const [isGeneratingCaptions, setIsGeneratingCaptions] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const videoRef = React.useRef<HTMLVideoElement | null>(null);
+  const fileInputRef = React.useRef<HTMLInputElement | null>(null);
 
-  const shakySegments = useMemo(
-    () => state?.segmentsFinal.filter((s) => s.type === "SHAKY") ?? [],
-    [state],
-  );
-  const captions = state?.captions;
-  const captionsReady = captions?.status === "ready" && !!captions.vttPath;
-  const canGenerateCaptions =
-    !!sessionId && !!recordingUrl && state?.status === "stopped";
+  const [theme, setTheme] = React.useState<Theme>("dark");
+  const [error, setError] = React.useState<string | null>(null);
+  const [clips, setClips] = React.useState<Clip[]>([]);
+  const [selectedClipId, setSelectedClipId] = React.useState<string | null>(null);
+  const clipsRef = React.useRef<Clip[]>([]);
+  const clipPointerDragRef = React.useRef<{
+    clipId: string;
+    pointerId: number;
+    startX: number;
+    startY: number;
+    hasDragged: boolean;
+  } | null>(null);
+  const suppressClipClickRef = React.useRef(false);
 
-  const start = async () => {
-    setError(null);
-    setExportPlan(null);
-    try {
-      const res = await api<SessionState>("/api/session/start", {
-        method: "POST",
-        body: JSON.stringify({ sessionId, source }),
-      });
-      setState(res);
-    } catch (e) {
-      setError(String(e));
+  const selectedClipIndex = React.useMemo(() => {
+    if (!selectedClipId) return -1;
+    return clips.findIndex((c) => c.id === selectedClipId);
+  }, [clips, selectedClipId]);
+
+  const selectedClip = selectedClipIndex >= 0 ? clips[selectedClipIndex] : null;
+  const selectedFile = selectedClip?.file ?? null;
+
+  const [videoUrl, setVideoUrl] = React.useState<string | null>(null);
+  const [posterUrl, setPosterUrl] = React.useState<string | null>(null);
+  const [duration, setDuration] = React.useState<number>(0);
+  const [currentTime, setCurrentTime] = React.useState<number>(0);
+  const [isPlaying, setIsPlaying] = React.useState<boolean>(false);
+  const [zoom, setZoom] = React.useState<number>(1);
+  const [isCropping, setIsCropping] = React.useState<boolean>(false);
+  const [isBladeMode, setIsBladeMode] = React.useState<boolean>(false);
+  const [timelineHoverTime, setTimelineHoverTime] = React.useState<number | null>(null);
+  const [draggingClipId, setDraggingClipId] = React.useState<string | null>(null);
+  const [clipDropTarget, setClipDropTarget] = React.useState<ClipDropTarget | null>(null);
+  const [isExporting, setIsExporting] = React.useState<boolean>(false);
+
+  const trimStart = selectedClip?.in ?? 0;
+  const trimEnd = selectedClip?.out ?? 0;
+  const cropRect = selectedClip?.crop ?? DEFAULT_CROP;
+
+  React.useEffect(() => {
+    const saved = localStorage.getItem("theme");
+    if (saved === "light" || saved === "dark") setTheme(saved);
+  }, []);
+
+  React.useEffect(() => {
+    document.documentElement.classList.toggle("dark", theme === "dark");
+    localStorage.setItem("theme", theme);
+  }, [theme]);
+
+  React.useEffect(() => {
+    if (!selectedFile) {
+      setVideoUrl(null);
+      setPosterUrl(null);
+      setDuration(0);
+      setCurrentTime(0);
+      setIsPlaying(false);
+      setIsCropping(false);
+      setIsExporting(false);
+      setZoom(1);
+      return;
     }
-  };
 
-  const ingestFile = (incoming: File) => {
-    const isMp4 =
-      incoming.type === "video/mp4" || incoming.name.toLowerCase().endsWith(".mp4");
-    if (!isMp4) {
+    const url = URL.createObjectURL(selectedFile);
+    setVideoUrl(url);
+    setPosterUrl(null);
+    setDuration(0);
+    setCurrentTime(0);
+    setIsPlaying(false);
+    setIsCropping(false);
+    setIsExporting(false);
+    return () => URL.revokeObjectURL(url);
+  }, [selectedFile]);
+
+  React.useEffect(() => {
+    clipsRef.current = clips;
+  }, [clips]);
+
+  React.useEffect(() => {
+    if (!selectedClipId) return;
+    const clip = clipsRef.current.find((c) => c.id === selectedClipId);
+    if (!clip) return;
+    const v = videoRef.current;
+    if (v) v.pause();
+    setIsPlaying(false);
+    setIsCropping(false);
+    setCurrentTime(clip.in);
+    if (v) v.currentTime = clip.in;
+  }, [selectedClipId]);
+
+  const canEdit = Boolean(selectedClip) && Boolean(videoUrl) && duration > 0;
+  const maxTime = Math.max(0.01, duration || 1);
+  const effectiveTrimEnd = trimEnd > 0 ? trimEnd : duration;
+  const hasCrop = canEdit && !isDefaultCrop(cropRect);
+  const canExport = canEdit && effectiveTrimEnd > trimStart && !isExporting;
+
+  const canZoomOut = canEdit && zoom > 0.5;
+  const canZoomIn = canEdit && zoom < 4;
+
+  React.useEffect(() => {
+    if (!isBladeMode) setTimelineHoverTime(null);
+  }, [isBladeMode]);
+
+  const timelineWidthPx = React.useMemo(() => {
+    const base = 120; // px/s
+    const width = (duration || 1) * base * zoom;
+    return Math.max(720, Math.round(width));
+  }, [duration, zoom]);
+
+  const trimLeftPx = duration > 0 ? (trimStart / duration) * timelineWidthPx : 0;
+  const trimRightPx =
+    duration > 0
+      ? (effectiveTrimEnd / duration) * timelineWidthPx
+      : timelineWidthPx;
+  const playheadPx =
+    duration > 0 ? (currentTime / duration) * timelineWidthPx : 0;
+
+  const timelineHoverPx =
+    duration > 0 && timelineHoverTime != null
+      ? (timelineHoverTime / duration) * timelineWidthPx
+      : null;
+
+  const pickFile = () => fileInputRef.current?.click();
+
+  const addClipAfter = (incoming: File, afterId: string | null) => {
+    if (!isMp4(incoming)) {
       toastManager.add({
         title: "Unsupported file",
         description: "Please upload an .mp4 video.",
@@ -321,16 +465,145 @@ export default function Home() {
       });
       return;
     }
+
     setError(null);
-    try {
-      const res = await api<SessionState>("/api/session/stop", {
-        method: "POST",
-        body: JSON.stringify({ sessionId, recordingUrl: recordingUrl || undefined }),
-      });
-      setState(res);
-    } catch (e) {
-      setError(String(e));
+    setIsExporting(false);
+    setIsCropping(false);
+
+    const newClip: Clip = {
+      id: makeClipId(),
+      file: incoming,
+      in: 0,
+      out: 0,
+      crop: DEFAULT_CROP,
+    };
+
+    setClips((prev) => {
+      if (prev.length === 0) return [newClip];
+      const idx = afterId ? prev.findIndex((c) => c.id === afterId) : prev.length - 1;
+      const insertAt = idx >= 0 ? idx + 1 : prev.length;
+      return [...prev.slice(0, insertAt), newClip, ...prev.slice(insertAt)];
+    });
+
+    setSelectedClipId(newClip.id);
+  };
+
+  const onFiles = (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    const afterId = clips.length === 0 ? null : selectedClipId;
+    addClipAfter(files[0], afterId);
+  };
+
+  const onDragOverStart: React.DragEventHandler<HTMLDivElement> = (e) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+  };
+
+  const onClickClipTile =
+    (clipId: string): React.MouseEventHandler<HTMLButtonElement> =>
+    (e) => {
+      if (suppressClipClickRef.current) {
+        suppressClipClickRef.current = false;
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      setSelectedClipId(clipId);
+    };
+
+  const onPointerDownClipTile =
+    (clipId: string): React.PointerEventHandler<HTMLButtonElement> =>
+    (e) => {
+      if (e.pointerType !== "mouse") return;
+      if (e.button !== 0) return;
+      clipPointerDragRef.current = {
+        clipId,
+        pointerId: e.pointerId,
+        startX: e.clientX,
+        startY: e.clientY,
+        hasDragged: false,
+      };
+      setClipDropTarget(null);
+      e.currentTarget.setPointerCapture(e.pointerId);
+    };
+
+  const onPointerMoveClipTile: React.PointerEventHandler<HTMLButtonElement> = (e) => {
+    const drag = clipPointerDragRef.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+
+    const dx = e.clientX - drag.startX;
+    const dy = e.clientY - drag.startY;
+    const thresholdPx = 4;
+    if (!drag.hasDragged && Math.hypot(dx, dy) < thresholdPx) return;
+
+    if (!drag.hasDragged) {
+      drag.hasDragged = true;
+      suppressClipClickRef.current = true;
+      setDraggingClipId(drag.clipId);
     }
+
+    const el = document.elementFromPoint(e.clientX, e.clientY) as HTMLElement | null;
+    const tile = el?.closest("[data-clip-tile]") as HTMLElement | null;
+    if (!tile) {
+      setClipDropTarget(null);
+      return;
+    }
+    const targetId = tile.getAttribute("data-clip-id");
+
+    if (!targetId || targetId === drag.clipId) {
+      setClipDropTarget(null);
+      return;
+    }
+
+    const rect = tile.getBoundingClientRect();
+    const position = e.clientX < rect.left + rect.width / 2 ? "before" : "after";
+    setClipDropTarget({ targetId, position });
+    setClips((prev) => moveClip(prev, drag.clipId, targetId, position));
+    e.preventDefault();
+  };
+
+  const onPointerEndClipTile: React.PointerEventHandler<HTMLButtonElement> = (e) => {
+    const drag = clipPointerDragRef.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    clipPointerDragRef.current = null;
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+    setDraggingClipId(null);
+    setClipDropTarget(null);
+    if (drag.hasDragged) {
+      window.setTimeout(() => {
+        suppressClipClickRef.current = false;
+      }, 0);
+    }
+  };
+
+  const onDragOverClipTile: React.DragEventHandler<HTMLButtonElement> = (e) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = e.dataTransfer.files?.length ? "copy" : "none";
+  };
+
+  const onDropStart: React.DragEventHandler<HTMLDivElement> = (e) => {
+    e.preventDefault();
+    const dropped = e.dataTransfer.files?.[0];
+    if (dropped) addClipAfter(dropped, null);
+  };
+
+  const onDropOnClipTile =
+    (targetId: string): React.DragEventHandler<HTMLButtonElement> =>
+    (e) => {
+      e.preventDefault();
+      const dropped = e.dataTransfer.files?.[0];
+      if (dropped) addClipAfter(dropped, targetId);
+      setClipDropTarget(null);
+    };
+
+  const seek = (t: number) => {
+    const v = videoRef.current;
+    if (!v) return;
+    const next = clamp(t, 0, Math.max(0, duration - 0.001));
+    v.currentTime = next;
+    setCurrentTime(next);
   };
 
   const togglePlay = async () => {
@@ -362,275 +635,496 @@ export default function Home() {
   const zoomOut = () =>
     setZoom((z) => clamp(Number((z - 0.25).toFixed(2)), 0.5, 4));
 
-  const split = () => {
-    toastManager.add({
-      title: "Split clip",
-      description: "Coming soon — functionality not wired yet.",
-      type: "info",
+  const toggleCrop = () => {
+    setIsCropping((prev) => {
+      if (!prev) videoRef.current?.pause();
+      return !prev;
     });
   };
 
-  const doExport = async () => {
-    try {
-      const res = await api<EditPlan>(`/api/session/${sessionId}/export`);
-      setExportPlan(res);
-    } catch (e) {
-      setError(String(e));
-    }
+  const resetCrop = () => {
+    if (!selectedClipId) return;
+    setClips((prev) =>
+      prev.map((c) => (c.id === selectedClipId ? { ...c, crop: DEFAULT_CROP } : c)),
+    );
   };
 
-  const generateCaptions = async () => {
-    if (!sessionId) return;
+  const updateCrop = (next: CropRect) => {
+    if (!selectedClipId) return;
+    setClips((prev) =>
+      prev.map((c) => (c.id === selectedClipId ? { ...c, crop: next } : c)),
+    );
+  };
+
+  const updateTrim = (start: number, end: number) => {
+    if (!selectedClipId) return;
+    setClips((prev) =>
+      prev.map((c) => (c.id === selectedClipId ? { ...c, in: start, out: end } : c)),
+    );
+  };
+
+  const splitClipAt = (time: number) => {
+    if (!selectedClip) return;
+    const file = selectedClip.file;
+    const t = clamp(time, 0, duration);
+
+    const candidateIdx = clips.findIndex((c) => {
+      if (c.file !== file) return false;
+      const end = c.out > 0 ? c.out : duration;
+      return t >= c.in && t <= end;
+    });
+
+    if (candidateIdx < 0) return;
+
+    const candidate = clips[candidateIdx];
+    const start = candidate.in;
+    const end = candidate.out > 0 ? candidate.out : duration;
+
+    if (t - start < SPLIT_MIN_GAP_S || end - t < SPLIT_MIN_GAP_S) {
+      toastManager.add({
+        title: "Can't split here",
+        description: "Move the cut point away from the clip edges and try again.",
+        type: "warning",
+      });
+      return;
+    }
+
+    const newId = makeClipId();
+
+    setClips((prev) => {
+      const idx = prev.findIndex((c) => c.id === candidate.id);
+      if (idx < 0) return prev;
+      const clip = prev[idx];
+      const clipEnd = clip.out > 0 ? clip.out : duration;
+      const first: Clip = { ...clip, out: t };
+      const second: Clip = { ...clip, id: newId, in: t, out: clipEnd };
+      const next = [...prev];
+      next.splice(idx, 1, first, second);
+      return next;
+    });
+
+    setSelectedClipId(newId);
+    setIsCropping(false);
+    videoRef.current?.pause();
+    setIsPlaying(false);
+    seek(t);
+
+    toastManager.add({
+      title: "Split clip",
+      description: `Created 2 clips at ${formatTime(t)}.`,
+      type: "success",
+    });
+  };
+
+  const exportClip = async () => {
+    if (!selectedClip) return;
+    if (duration <= 0) return;
+    if (effectiveTrimEnd <= trimStart) return;
+
+    setIsExporting(true);
     setError(null);
-    setIsGeneratingCaptions(true);
+    videoRef.current?.pause();
+
     try {
-      const res = await api<SessionState>(`/api/session/${sessionId}/captions`, {
+      const formData = new FormData();
+      formData.append("file", selectedClip.file, selectedClip.file.name);
+      formData.append("trimStart", String(trimStart));
+      formData.append("trimEnd", String(effectiveTrimEnd));
+      formData.append("crop", JSON.stringify(cropRect));
+
+      const res = await fetch("/api/edit", {
         method: "POST",
-        body: JSON.stringify({ recordingUrl: recordingUrl || undefined }),
+        body: formData,
       });
-      setState(res);
-    } catch (e) {
-      setError(String(e));
+
+      if (!res.ok) {
+        const maybeJson = await res.json().catch(() => null);
+        const msg = (() => {
+          if (typeof maybeJson?.error === "string") return maybeJson.error;
+          if (res.status === 404) {
+            return "Export endpoint not found (/api/edit). If you just added the route, restart the dev server.";
+          }
+          return `Export failed (${res.status})`;
+        })();
+        throw new Error(msg);
+      }
+
+      const base = selectedClip.file.name.replace(/\\.mp4$/i, "");
+      const part = selectedClipIndex >= 0 ? `_clip_${selectedClipIndex + 1}` : "";
+      const fileName = `${base || "video"}${part}_edited.mp4`;
+
+      const showSaveFilePicker = (window as unknown as { showSaveFilePicker?: unknown })
+        .showSaveFilePicker as
+        | undefined
+        | ((options: unknown) => Promise<{ createWritable: () => Promise<{ write: (chunk: unknown) => Promise<void>; close: () => Promise<void> }> }>);
+
+      if (showSaveFilePicker && res.body) {
+        const handle = await showSaveFilePicker({
+          suggestedName: fileName,
+          types: [
+            {
+              description: "MP4 video",
+              accept: { "video/mp4": [".mp4"] },
+            },
+          ],
+        });
+
+        const writable = await handle.createWritable();
+        const reader = res.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          await writable.write(value);
+        }
+        await writable.close();
+      } else {
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        window.setTimeout(() => URL.revokeObjectURL(url), 5000);
+      }
+
+      toastManager.add({
+        title: "Export complete",
+        description: "Downloaded edited video.",
+        type: "success",
+      });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      toastManager.add({
+        title: "Export failed",
+        description: message,
+        type: "error",
+      });
     } finally {
-      setIsGeneratingCaptions(false);
+      setIsExporting(false);
     }
   };
 
-  const simulateTick = async (shaky: boolean) => {
-    if (!sessionId) return;
-    const ts = (state?.rawTicks.length ?? 0) + 1;
-    const confidence = shaky ? 0.96 : 0.2;
-    const raw = { shaky, confidence };
-    try {
-      const res = await api<SessionState>(`/api/session/${sessionId}/tick`, {
-        method: "POST",
-        body: JSON.stringify({
-          tick: ts,
-          ts,
-          raw,
-        }),
-      });
-      setState(res);
-    } catch (e) {
-      setError(String(e));
-    }
+  const clearProject = () => {
+    const v = videoRef.current;
+    if (v) v.pause();
+    setClips([]);
+    setSelectedClipId(null);
   };
-
-  useEffect(() => {
-    refresh();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    if (state?.recordingUrl && !recordingUrl) {
-      setRecordingUrl(state.recordingUrl);
-    }
-  }, [recordingUrl, state?.recordingUrl]);
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-800 text-slate-50">
-      <div className="mx-auto flex max-w-5xl flex-col gap-6 px-6 py-10">
-        <header className="flex flex-col gap-2">
-          <p className="text-xs uppercase tracking-[0.2em] text-slate-400">
-            Overshoot Auto-Editor
-          </p>
-          <h1 className="text-4xl font-semibold text-slate-50">
-            CUT / STABILIZE / BRIDGE
-          </h1>
-          <p className="max-w-2xl text-sm text-slate-300">
-            Stream via Overshoot, label shaky seconds at 1 Hz, smooth with
-            2-of-3 rule, and export an edit plan. UI keeps controls minimal for
-            hackathon speed.
-          </p>
-        </header>
-
-        <section className="grid gap-4 rounded-2xl border border-white/10 bg-white/5 p-4 shadow-lg backdrop-blur">
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
-            <label className="flex flex-col gap-1 text-sm">
-              <span className="text-xs uppercase tracking-[0.15em] text-slate-400">
-                Session ID
-              </span>
-              <input
-                value={sessionId}
-                onChange={(e) => setSessionId(e.target.value)}
-                className="rounded-lg border border-white/10 bg-white/10 px-3 py-2 text-sm text-white outline-none focus:border-cyan-400"
-              />
-            </label>
-            <label className="flex flex-col gap-1 text-sm">
-              <span className="text-xs uppercase tracking-[0.15em] text-slate-400">
-                Source
-              </span>
-              <input
-                value={source}
-                onChange={(e) => setSource(e.target.value)}
-                className="rounded-lg border border-white/10 bg-white/10 px-3 py-2 text-sm text-white outline-none focus:border-cyan-400"
-              />
-            </label>
-            <div className="flex items-end gap-2">
-              <button
-                onClick={start}
-                className="flex-1 rounded-lg bg-cyan-500 px-3 py-2 text-sm font-semibold text-slate-950 transition hover:bg-cyan-400"
-              >
-                Start
-              </button>
-              <button
-                onClick={stop}
-                className="flex-1 rounded-lg border border-white/20 px-3 py-2 text-sm font-semibold text-white transition hover:border-white"
-              >
-                Stop
-              </button>
-              <button
-                onClick={refresh}
-                className="rounded-lg border border-white/10 px-3 py-2 text-xs font-semibold text-white transition hover:border-white"
-              >
-                Refresh
-              </button>
+    <ToastProvider>
+      <div className="min-h-screen bg-background text-foreground">
+        <div className="mx-auto flex min-h-screen max-w-7xl flex-col gap-6 px-6 py-8">
+          {clips.length === 0 ? (
+            <div className="fixed right-6 top-6 z-50">
+              <ThemeToggle theme={theme} onChange={setTheme} />
             </div>
-            <label className="flex flex-col gap-1 text-sm md:col-span-3">
-              <span className="text-xs uppercase tracking-[0.15em] text-slate-400">
-                Recording URL (required for captions)
-              </span>
-              <input
-                value={recordingUrl}
-                onChange={(e) => setRecordingUrl(e.target.value)}
-                placeholder="https://.../recording.mp4 or /path/to/file"
-                className="rounded-lg border border-white/10 bg-white/10 px-3 py-2 text-sm text-white outline-none focus:border-cyan-400"
-              />
-            </label>
-          </div>
+          ) : (
+            <header className="flex flex-wrap items-center justify-between gap-4">
+              <div className="min-w-0">
+                <div className="truncate font-semibold text-lg leading-tight">
+                  {selectedClip?.file.name ?? "Untitled"}
+                </div>
+                <div className="mt-1 text-muted-foreground text-xs tabular-nums">
+                  {selectedClipIndex >= 0
+                    ? `Clip ${selectedClipIndex + 1} / ${clips.length}`
+                    : `${clips.length} clips`}
+                  {duration > 0 ? ` • ${formatTime(duration)} total` : " • Loading…"}
+                </div>
+              </div>
+
+              <div className="flex items-center gap-3">
+                <Button onClick={pickFile} size="sm" variant="outline">
+                  <FolderOpenIcon className="size-4" />
+                  Add clip
+                </Button>
+                <Button disabled={!canExport} onClick={exportClip} size="sm" variant="secondary">
+                  {isExporting ? "Exporting…" : "Export clip"}
+                </Button>
+                <Button onClick={clearProject} size="sm" variant="ghost">
+                  Clear
+                </Button>
+                <Separator className="h-8" orientation="vertical" />
+                <ThemeToggle theme={theme} onChange={setTheme} />
+              </div>
+            </header>
+          )}
+
+          <input
+            ref={fileInputRef}
+            accept="video/mp4"
+            className="hidden"
+            onChange={(e) => {
+              onFiles(e.target.files);
+              e.currentTarget.value = "";
+            }}
+            type="file"
+          />
+
+          {error && (
+            <Alert variant="error">
+              <AlertTitle>Something went wrong</AlertTitle>
+              <AlertDescription>{error}</AlertDescription>
+            </Alert>
+          )}
+
+          {clips.length === 0 ? (
+            <main className="flex flex-1 items-center justify-center py-8">
+              <div
+                className="w-full max-w-3xl rounded-2xl border border-dashed bg-muted/40 p-10 transition-colors hover:bg-muted/60"
+                onClick={pickFile}
+                onDragOver={onDragOverStart}
+                onDrop={onDropStart}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") pickFile();
+                }}
+                role="button"
+                tabIndex={0}
+              >
+                <Empty>
+                  <EmptyHeader>
+                    <EmptyMedia variant="icon">
+                      <UploadIcon />
+                    </EmptyMedia>
+                    <EmptyTitle>Drop an MP4 to start</EmptyTitle>
+                    <EmptyDescription>
+                      Drag and drop your video here, or click to choose a file.
+                    </EmptyDescription>
+                  </EmptyHeader>
+                  <EmptyContent>
+                    <Button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        pickFile();
+                      }}
+                    >
+                      <UploadIcon className="size-4" />
+                      Choose video
+                    </Button>
+                  </EmptyContent>
+                </Empty>
+              </div>
+            </main>
+          ) : (
+            <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_380px]">
+              <div className="min-h-0 space-y-10">
+                <section className="space-y-3">
+                  <div className="flex items-end justify-between gap-4">
+                    <div>
+                      <div className="font-semibold text-sm">Preview</div>
+                      <div className="text-muted-foreground text-xs tabular-nums">
+                        {duration > 0 ? (
+                          <span className="tabular-nums">
+                            {formatTime(currentTime)} / {formatTime(duration)}
+                          </span>
+                        ) : (
+                          "Loading video…"
+                        )}
+                      </div>
+                    </div>
+                  </div>
 
                   <div className="relative overflow-hidden rounded-xl bg-black">
                     <video
                       ref={videoRef}
                       className="aspect-video w-full"
+                      poster={posterUrl ?? undefined}
                       onLoadedMetadata={(e) => {
                         const v = e.currentTarget;
                         const d = Number.isFinite(v.duration) ? v.duration : 0;
                         setDuration(d);
-                        setTrimStart(0);
-                        setTrimEnd(d);
-                        setCropRect(DEFAULT_CROP);
+                        if (!selectedClipId) return;
+
+                        setClips((prev) =>
+                          prev.map((c) => {
+                            if (c.id !== selectedClipId) return c;
+                            const nextIn = clamp(c.in, 0, d);
+                            const nextOut = c.out > 0 ? clamp(c.out, 0, d) : d;
+                            const orderedIn = Math.min(nextIn, nextOut);
+                            const orderedOut = Math.max(nextIn, nextOut);
+                            return { ...c, in: orderedIn, out: orderedOut };
+                          }),
+                        );
+
+                        const start = clamp(trimStart, 0, Math.max(0, d - 0.001));
+                        v.currentTime = start;
+                        setCurrentTime(start);
                       }}
                       onPause={() => setIsPlaying(false)}
-	                      onPlay={() => setIsPlaying(true)}
-	                      onTimeUpdate={(e) => {
-	                        const t = e.currentTarget.currentTime;
-	                        if (!e.currentTarget.paused && t < trimStart) {
-	                          e.currentTarget.currentTime = trimStart;
-	                          setCurrentTime(trimStart);
-	                          return;
-	                        }
-	                        if (effectiveTrimEnd > 0 && t > effectiveTrimEnd) {
-	                          e.currentTarget.pause();
-	                          e.currentTarget.currentTime = effectiveTrimEnd;
-	                          setCurrentTime(effectiveTrimEnd);
-	                          return;
+                      onPlay={() => setIsPlaying(true)}
+                      onTimeUpdate={(e) => {
+                        const t = e.currentTarget.currentTime;
+                        if (!e.currentTarget.paused && t < trimStart) {
+                          e.currentTarget.currentTime = trimStart;
+                          setCurrentTime(trimStart);
+                          return;
+                        }
+                        if (effectiveTrimEnd > 0 && t > effectiveTrimEnd) {
+                          e.currentTarget.pause();
+                          e.currentTarget.currentTime = effectiveTrimEnd;
+                          setCurrentTime(effectiveTrimEnd);
+                          return;
                         }
                         setCurrentTime(t);
                       }}
                       src={videoUrl ?? undefined}
                     />
                     {isCropping && (
-                      <CropOverlay crop={cropRect} active={isCropping} onChange={setCropRect} />
+                      <CropOverlay crop={cropRect} active={isCropping} onChange={updateCrop} />
                     )}
                   </div>
 
-          <div className="flex flex-wrap items-center gap-2 text-xs text-slate-300">
-            <button
-              onClick={() => simulateTick(false)}
-              className="rounded-lg border border-green-400/50 px-3 py-1 font-semibold text-green-200 hover:border-green-300"
-            >
-              + Good tick
-            </button>
-            <button
-              onClick={() => simulateTick(true)}
-              className="rounded-lg border border-red-400/50 px-3 py-1 font-semibold text-red-200 hover:border-red-300"
-            >
-              + Shaky tick
-            </button>
-            <span className="text-slate-400">
-              (Dev helper: simulates 1 Hz labeling)
-            </span>
-          </div>
-        </section>
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex items-center gap-2">
+                      <IconButton label="First frame" disabled={!canEdit} onClick={goFirst}>
+                        <SkipBackIcon className="size-4" />
+                      </IconButton>
+                      <IconButton label={isPlaying ? "Pause" : "Play"} disabled={!canEdit} onClick={togglePlay}>
+                        {isPlaying ? (
+                          <PauseIcon className="size-4" />
+                        ) : (
+                          <PlayIcon className="size-4" />
+                        )}
+                      </IconButton>
+                      <IconButton label="Last frame" disabled={!canEdit} onClick={goLast}>
+                        <SkipForwardIcon className="size-4" />
+                      </IconButton>
+                      <IconButton
+                        label={isCropping ? "Done cropping" : hasCrop ? "Edit crop" : "Crop"}
+                        disabled={!canEdit}
+                        onClick={toggleCrop}
+                        variant={isCropping || hasCrop ? "secondary" : "outline"}
+                      >
+                        <CropIcon className="size-4" />
+                      </IconButton>
+                      <Separator className="mx-1 h-7" orientation="vertical" />
+                      <IconButton label="Zoom out" disabled={!canZoomOut} onClick={zoomOut}>
+                        <ZoomOutIcon className="size-4" />
+                      </IconButton>
+                      <IconButton label="Zoom in" disabled={!canZoomIn} onClick={zoomIn}>
+                        <ZoomInIcon className="size-4" />
+                      </IconButton>
+                      <IconButton
+                        label={
+                          isBladeMode
+                            ? "Blade tool on (click timeline to split)"
+                            : "Blade tool (click timeline to split)"
+                        }
+                        disabled={!canEdit}
+                        onClick={() => setIsBladeMode((prev) => !prev)}
+                        pressed={isBladeMode}
+                        variant={isBladeMode ? "secondary" : "outline"}
+                      >
+                        <ScissorsIcon className="size-4" />
+                      </IconButton>
+                    </div>
 
-        <section className="rounded-2xl border border-white/10 bg-white/5 p-4 shadow-lg backdrop-blur">
-          <div className="flex items-center justify-between">
-            <h2 className="text-lg font-semibold text-white">Segments</h2>
-            <span className="text-sm text-slate-300">
-              {shakySegments.length} shaky / {state?.segmentsFinal.length ?? 0} total
-            </span>
-          </div>
-          <div className="mt-4 grid gap-3">
-            {(state?.segmentsFinal ?? []).map((seg) => (
-              <SegmentRow
-                key={seg.id}
-                seg={seg}
-                onChangeFix={(fix) => updateFix(seg.id, fix)}
-              />
-            ))}
-            {(state?.segmentsFinal ?? []).length === 0 && (
-              <p className="text-sm text-slate-400">No segments yet.</p>
-            )}
-          </div>
-        </section>
+                    <div className="text-muted-foreground text-xs tabular-nums">
+                      {formatTime(currentTime)}
+                    </div>
+                  </div>
 
-        <section className="rounded-2xl border border-white/10 bg-white/5 p-4 shadow-lg backdrop-blur">
-          <div className="flex flex-wrap items-center gap-3">
-            <button
-              onClick={generateCaptions}
-              className="rounded-lg bg-indigo-400 px-3 py-2 text-sm font-semibold text-slate-950 transition hover:bg-indigo-300 disabled:opacity-60"
-              disabled={!canGenerateCaptions || isGeneratingCaptions}
-            >
-              {isGeneratingCaptions ? "Generating..." : "Generate captions (VTT)"}
-            </button>
-            <span className="text-sm text-slate-300">
-              Status: {captions?.status ?? "idle"}
-            </span>
-            {captionsReady && (
-              <a
-                href={`/api/session/${sessionId}/captions/file`}
-                className="text-sm font-semibold text-indigo-200 hover:text-indigo-100"
-              >
-                Download VTT
-              </a>
-            )}
-          </div>
-          {captions?.status === "error" && (
-            <div className="mt-3 text-xs text-red-200">
-              {captions.error ?? "Caption generation failed."}
-            </div>
-          )}
-          {!recordingUrl && (
-            <div className="mt-3 text-xs text-slate-400">
-              Provide a recording URL or local path to enable captioning.
-            </div>
-          )}
-        </section>
+                  {(isCropping || hasCrop) && (
+                    <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border bg-muted/40 px-4 py-3">
+                      <div className="text-muted-foreground text-xs">
+                        {isCropping
+                          ? "Drag the corners to crop. Export will use this crop."
+                          : "Crop is set and will apply on export."}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Button disabled={!canEdit} onClick={resetCrop} size="xs" variant="outline">
+                          Reset crop
+                        </Button>
+                        {isCropping && (
+                          <Button disabled={!canEdit} onClick={toggleCrop} size="xs">
+                            Done
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </section>
 
-        <section className="rounded-2xl border border-white/10 bg-white/5 p-4 shadow-lg backdrop-blur">
-          <div className="flex items-center gap-2">
-            <button
-              onClick={doExport}
-              className="rounded-lg bg-emerald-500 px-3 py-2 text-sm font-semibold text-slate-950 transition hover:bg-emerald-400"
-            >
-              Export edit_plan.json
-            </button>
-            <button className="rounded-lg border border-white/20 px-3 py-2 text-sm font-semibold text-white opacity-60" disabled>
-              Render (stub)
-            </button>
-            {exportPlan && (
-              <span className="text-sm text-emerald-200">
-                Export ready (version {exportPlan.version})
-              </span>
-            )}
-          </div>
-          {exportPlan && (
-            <pre className="mt-3 max-h-64 overflow-auto rounded-lg bg-black/40 p-3 text-xs text-emerald-100">
-              {JSON.stringify(exportPlan, null, 2)}
-            </pre>
-          )}
-        </section>
+                <section className="space-y-4">
+                  <div className="flex items-end justify-between gap-4">
+                    <div>
+                      <div className="font-semibold text-sm">Clips</div>
+                      <div className="text-muted-foreground text-xs">
+                        Drag to reorder. Drop MP4s to insert after a clip.
+                      </div>
+                    </div>
+                    <div className="text-muted-foreground text-xs tabular-nums">
+                      {clips.length} total
+                    </div>
+                  </div>
+
+                  <div className="overflow-hidden rounded-xl border bg-muted/40">
+                    <ScrollArea scrollbarGutter>
+                      <div className="flex w-max items-start gap-2 p-2">
+                        {clips.map((clip, idx) => {
+                          const isSelected = clip.id === selectedClipId;
+                          const isDragging = clip.id === draggingClipId;
+                          const dropPosition =
+                            clipDropTarget?.targetId === clip.id
+                              ? clipDropTarget.position
+                              : null;
+                          const knownEnd = clip.out > 0 ? clip.out : 0;
+                          const len = knownEnd > clip.in ? knownEnd - clip.in : 0;
+                          return (
+                            <div
+                              key={clip.id}
+                              className="relative"
+                              data-clip-id={clip.id}
+                              data-clip-tile="true"
+                            >
+                              {dropPosition === "before" && (
+                                <div className="pointer-events-none absolute -left-1 top-2 bottom-2 w-0.5 rounded bg-primary" />
+                              )}
+                              {dropPosition === "after" && (
+                                <div className="pointer-events-none absolute -right-1 top-2 bottom-2 w-0.5 rounded bg-primary" />
+                              )}
+                              <Button
+                                onClick={onClickClipTile(clip.id)}
+                                onDragOver={onDragOverClipTile}
+                                onDrop={onDropOnClipTile(clip.id)}
+                                onPointerCancel={onPointerEndClipTile}
+                                onPointerDown={onPointerDownClipTile(clip.id)}
+                                onPointerMove={onPointerMoveClipTile}
+                                onPointerUp={onPointerEndClipTile}
+                                size="sm"
+                                variant="outline"
+                                className={`w-52 !h-auto cursor-grab flex-col !items-start !justify-start !gap-1 overflow-hidden !px-3 !py-2 text-left active:cursor-grabbing ${isSelected ? "border-primary bg-primary/10 shadow-primary/20 shadow-sm ring-1 ring-primary/20" : ""} ${isDragging ? "opacity-50" : ""}`}
+                              >
+                                <div className="flex w-full min-w-0 items-center justify-between gap-2">
+                                  <div className="flex min-w-0 items-center gap-1">
+                                    <GripVerticalIcon className="size-3.5 text-muted-foreground/70" />
+                                    <span className="font-medium text-xs tabular-nums">
+                                      Clip {idx + 1}
+                                    </span>
+                                  </div>
+                                  <span className="shrink-0 text-muted-foreground text-[10px] tabular-nums">
+                                    {clip.out > 0 ? `${len.toFixed(1)}s` : "…"}
+                                  </span>
+                                </div>
+                                <div className="w-full min-w-0 truncate text-[10px] text-muted-foreground">
+                                  {clip.file.name}
+                                </div>
+                                <div className="flex w-full min-w-0 items-center justify-between gap-2 text-[10px] text-muted-foreground tabular-nums">
+                                  <span className="truncate">In {formatTime(clip.in)}</span>
+                                  <span className="truncate">
+                                    Out {clip.out > 0 ? formatTime(clip.out) : "…"}
+                                  </span>
+                                </div>
+                              </Button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </ScrollArea>
+                  </div>
+                </section>
 
                 <section className="space-y-4">
                   <div className="flex items-end justify-between gap-4">
@@ -669,8 +1163,7 @@ export default function Home() {
                           const nextEnd = clamp(b, 0, duration);
                           const orderedStart = Math.min(nextStart, nextEnd);
                           const orderedEnd = Math.max(nextStart, nextEnd);
-                          setTrimStart(orderedStart);
-                          setTrimEnd(orderedEnd);
+                          updateTrim(orderedStart, orderedEnd);
                           if (currentTime < orderedStart) seek(orderedStart);
                           if (currentTime > orderedEnd) seek(Math.max(0, orderedEnd - 0.001));
                         }}
@@ -698,13 +1191,26 @@ export default function Home() {
                     <div className="overflow-hidden rounded-xl border bg-muted/40">
                       <ScrollArea scrollbarGutter>
                         <div
-                          className="relative h-18 select-none"
+                          className={`relative h-18 select-none ${isBladeMode ? "cursor-crosshair" : "cursor-pointer"}`}
                           onPointerDown={(e) => {
-                            if (!duration) return;
+                            if (!duration || !canEdit) return;
                             const rect = e.currentTarget.getBoundingClientRect();
                             const x = e.clientX - rect.left;
                             const ratio = clamp(x / rect.width, 0, 1);
-                            seek(ratio * duration);
+                            const t = ratio * duration;
+                            if (isBladeMode) {
+                              splitClipAt(t);
+                              return;
+                            }
+                            seek(t);
+                          }}
+                          onPointerLeave={() => setTimelineHoverTime(null)}
+                          onPointerMove={(e) => {
+                            if (!duration || !isBladeMode) return;
+                            const rect = e.currentTarget.getBoundingClientRect();
+                            const x = e.clientX - rect.left;
+                            const ratio = clamp(x / rect.width, 0, 1);
+                            setTimelineHoverTime(ratio * duration);
                           }}
                           role="presentation"
                           style={{
@@ -725,6 +1231,20 @@ export default function Home() {
                             className="pointer-events-none absolute inset-y-0 w-px bg-primary"
                             style={{ left: `${playheadPx}px` }}
                           />
+                          {isBladeMode && timelineHoverPx != null && timelineHoverTime != null && (
+                            <>
+                              <div
+                                className="pointer-events-none absolute inset-y-0 w-px bg-destructive"
+                                style={{ left: `${timelineHoverPx}px` }}
+                              />
+                              <div
+                                className="pointer-events-none absolute bottom-2 -translate-x-1/2 rounded-md bg-background/80 px-1.5 py-0.5 text-xs text-foreground tabular-nums shadow"
+                                style={{ left: `${timelineHoverPx}px` }}
+                              >
+                                {formatTime(timelineHoverTime)}
+                              </div>
+                            </>
+                          )}
                           <div className="pointer-events-none absolute bottom-2 left-2 right-2 flex items-center justify-between text-muted-foreground text-xs tabular-nums">
                             <span>0:00.0</span>
                             <span>{formatTime(duration)}</span>
@@ -751,6 +1271,10 @@ export default function Home() {
                         <SparklesIcon className="size-4" />
                         Copilot
                       </TabsTrigger>
+                      <TabsTrigger value="overshoot">
+                        <FolderOpenIcon className="size-4" />
+                        Overshoot
+                      </TabsTrigger>
                       <TabsTrigger value="notes">
                         <FilmIcon className="size-4" />
                         Notes
@@ -767,6 +1291,14 @@ export default function Home() {
                           Tip: we’ll surface suggestions here and apply them to the timeline.
                         </div>
                       </div>
+                    </TabsContent>
+
+                    <TabsContent className="mt-4" value="overshoot">
+                      <OvershootAnalyzer
+                        file={selectedFile}
+                        durationSeconds={duration}
+                        onSelectThumbnail={(url) => setPosterUrl(url)}
+                      />
                     </TabsContent>
 
                     <TabsContent className="mt-4" value="notes">
