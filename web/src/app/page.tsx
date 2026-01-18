@@ -67,6 +67,12 @@ type ClipDropTarget = {
 
 type ClipTrimHandle = "start" | "end";
 
+type CopilotOp =
+  | { tool: "cut_range"; startSeconds: number; endSeconds: number }
+  | { tool: "trim_current"; startSeconds: number; endSeconds: number }
+  | { tool: "split_at"; timeSeconds: number }
+  | { tool: "set_crop"; crop: CropRect };
+
 function formatTime(seconds: number) {
   const s = Math.max(0, seconds);
   const m = Math.floor(s / 60);
@@ -92,6 +98,95 @@ function makeClipId() {
     return `clip_${crypto.randomUUID()}`;
   }
   return `clip_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function cloneClips(clips: Clip[]) {
+  return clips.map((c) => ({ ...c, crop: { ...c.crop } }));
+}
+
+function clipEffectiveEnd(clip: Clip, duration: number) {
+  return clip.out > 0 ? clip.out : duration;
+}
+
+function applySplitAtOnFile(opts: { clips: Clip[]; file: File; duration: number; time: number }) {
+  const t = clamp(opts.time, 0, opts.duration);
+  const idx = opts.clips.findIndex((c) => {
+    if (c.file !== opts.file) return false;
+    const end = clipEffectiveEnd(c, opts.duration);
+    return t >= c.in && t <= end;
+  });
+  if (idx < 0) return { clips: opts.clips, newId: null };
+
+  const candidate = opts.clips[idx];
+  const start = candidate.in;
+  const end = clipEffectiveEnd(candidate, opts.duration);
+  if (t - start < SPLIT_MIN_GAP_S || end - t < SPLIT_MIN_GAP_S) {
+    return { clips: opts.clips, newId: null };
+  }
+
+  const newId = makeClipId();
+  const first: Clip = { ...candidate, out: t };
+  const second: Clip = { ...candidate, id: newId, in: t, out: end };
+  const next = [...opts.clips];
+  next.splice(idx, 1, first, second);
+  return { clips: next, newId };
+}
+
+function applyCutRangeOnFile(opts: {
+  clips: Clip[];
+  file: File;
+  duration: number;
+  start: number;
+  end: number;
+}) {
+  const start = clamp(opts.start, 0, opts.duration);
+  const end = clamp(opts.end, 0, opts.duration);
+  if (end <= start) return opts.clips;
+
+  const next: Clip[] = [];
+
+  for (const clip of opts.clips) {
+    if (clip.file !== opts.file) {
+      next.push(clip);
+      continue;
+    }
+
+    const clipStart = clamp(clip.in, 0, opts.duration);
+    const clipEndRaw = clipEffectiveEnd(clip, opts.duration);
+    const clipEnd = clamp(clipEndRaw, 0, opts.duration);
+    const a = Math.min(clipStart, clipEnd);
+    const b = Math.max(clipStart, clipEnd);
+
+    if (b <= a) continue;
+    if (end <= a || start >= b) {
+      next.push({ ...clip, in: a, out: b });
+      continue;
+    }
+
+    const coversAll = start <= a && end >= b;
+    if (coversAll) continue;
+
+    const overlapsStart = start <= a && end < b;
+    if (overlapsStart) {
+      const newIn = end;
+      if (b - newIn >= SPLIT_MIN_GAP_S) next.push({ ...clip, in: newIn, out: b });
+      continue;
+    }
+
+    const overlapsEnd = start > a && end >= b;
+    if (overlapsEnd) {
+      const newOut = start;
+      if (newOut - a >= SPLIT_MIN_GAP_S) next.push({ ...clip, in: a, out: newOut });
+      continue;
+    }
+
+    const firstLen = start - a;
+    const secondLen = b - end;
+    if (firstLen >= SPLIT_MIN_GAP_S) next.push({ ...clip, in: a, out: start });
+    if (secondLen >= SPLIT_MIN_GAP_S) next.push({ ...clip, id: makeClipId(), in: end, out: b });
+  }
+
+  return next;
 }
 
 function moveClip(
@@ -376,6 +471,12 @@ export default function Home() {
   const [trimmingClipId, setTrimmingClipId] = React.useState<string | null>(null);
   const [isExporting, setIsExporting] = React.useState<boolean>(false);
   const [fillGapsWithBlack, setFillGapsWithBlack] = React.useState<boolean>(false);
+  const [copilotPrompt, setCopilotPrompt] = React.useState<string>("");
+  const [copilotMessage, setCopilotMessage] = React.useState<string | null>(null);
+  const [copilotBusy, setCopilotBusy] = React.useState<boolean>(false);
+  const [copilotUndoStack, setCopilotUndoStack] = React.useState<
+    Array<{ clips: Clip[]; selectedClipId: string | null }>
+  >([]);
 
   const clipTrimRef = React.useRef<{
     clipId: string;
@@ -425,6 +526,36 @@ export default function Home() {
   React.useEffect(() => {
     clipsRef.current = clips;
   }, [clips]);
+
+  const canCopilotUndo = copilotUndoStack.length > 0;
+
+  const pushCopilotUndo = React.useCallback(() => {
+    setCopilotUndoStack((prev) => {
+      const entry = { clips: cloneClips(clipsRef.current), selectedClipId };
+      const capped = prev.length >= 50 ? prev.slice(prev.length - 49) : prev;
+      return [...capped, entry];
+    });
+  }, [selectedClipId]);
+
+  const copilotUndo = React.useCallback(() => {
+    setCopilotUndoStack((prev) => {
+      const last = prev[prev.length - 1];
+      if (!last) return prev;
+      setClips(last.clips);
+      setSelectedClipId(last.selectedClipId);
+      toastManager.add({ title: "Undid copilot edit", description: "Reverted last copilot change.", type: "info" });
+      return prev.slice(0, -1);
+    });
+  }, []);
+
+  React.useEffect(() => {
+    if (!selectedClipId) {
+      if (clips.length > 0) setSelectedClipId(clips[0].id);
+      return;
+    }
+    const exists = clips.some((c) => c.id === selectedClipId);
+    if (!exists) setSelectedClipId(clips[0]?.id ?? null);
+  }, [clips, selectedClipId]);
 
   const advanceToNextClip = React.useCallback(() => {
     if (pendingAutoplayNextClipRef.current) return true;
@@ -798,6 +929,129 @@ export default function Home() {
     );
   };
 
+  const applyCopilotOperations = (operations: CopilotOp[], message?: string) => {
+    if (!selectedClip || !selectedClipId || duration <= 0) return;
+    pushCopilotUndo();
+    const file = selectedClip.file;
+    let next = clipsRef.current;
+    let nextSelectedId: string | null = selectedClipId;
+
+    for (const op of operations) {
+      if (op.tool === "cut_range") {
+        next = applyCutRangeOnFile({
+          clips: next,
+          file,
+          duration,
+          start: op.startSeconds,
+          end: op.endSeconds,
+        });
+        continue;
+      }
+
+      if (op.tool === "trim_current") {
+        const start = clamp(op.startSeconds, 0, duration);
+        const end = clamp(op.endSeconds, 0, duration);
+        if (end <= start) continue;
+        next = next.map((c) => (c.id === selectedClipId ? { ...c, in: start, out: end } : c));
+        continue;
+      }
+
+      if (op.tool === "set_crop") {
+        next = next.map((c) => (c.id === selectedClipId ? { ...c, crop: op.crop } : c));
+        continue;
+      }
+
+      if (op.tool === "split_at") {
+        const res = applySplitAtOnFile({ clips: next, file, duration, time: op.timeSeconds });
+        next = res.clips;
+        if (res.newId) nextSelectedId = res.newId;
+        continue;
+      }
+    }
+
+    setClips(next);
+    if (nextSelectedId && next.some((c) => c.id === nextSelectedId)) {
+      setSelectedClipId(nextSelectedId);
+    } else {
+      setSelectedClipId(next[0]?.id ?? null);
+    }
+
+    toastManager.add({
+      title: "Copilot applied",
+      description: message || "Updated your timeline.",
+      type: "success",
+    });
+  };
+
+  const runCopilot = async () => {
+    if (!selectedClip || duration <= 0) {
+      toastManager.add({
+        title: "No clip selected",
+        description: "Select a clip first so I know what to edit.",
+        type: "warning",
+      });
+      return;
+    }
+    if (!copilotPrompt.trim()) return;
+
+    setCopilotBusy(true);
+    setCopilotMessage(null);
+
+    try {
+      const fileClips = clipsRef.current
+        .filter((c) => c.file === selectedClip.file)
+        .map((c) => ({ id: c.id, in: c.in, out: clipEffectiveEnd(c, duration), crop: c.crop }));
+
+      const res = await fetch("/api/assistant/copilot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: copilotPrompt,
+          durationSeconds: duration,
+          selection: {
+            clipId: selectedClipId,
+            in: trimStart,
+            out: effectiveTrimEnd,
+            crop: cropRect,
+          },
+          clips: fileClips,
+        }),
+      });
+
+      const payload = await res.json().catch(() => null);
+      if (!res.ok) {
+        const msg = typeof payload?.error === "string" ? payload.error : `Copilot failed (${res.status})`;
+        throw new Error(msg);
+      }
+
+      const message = typeof payload?.message === "string" ? payload.message : null;
+      const operations = Array.isArray(payload?.operations) ? (payload.operations as CopilotOp[]) : [];
+
+      setCopilotMessage(message);
+
+      if (operations.length === 0) {
+        toastManager.add({
+          title: "No edits suggested",
+          description: message || "Try a more specific request (e.g. “cut 0:10 to 0:20”).",
+          type: "info",
+        });
+        return;
+      }
+
+      applyCopilotOperations(operations, message || undefined);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      toastManager.add({
+        title: "Copilot error",
+        description: message,
+        type: "error",
+      });
+      setCopilotMessage(message);
+    } finally {
+      setCopilotBusy(false);
+    }
+  };
+
   const splitClipAt = (time: number) => {
     if (!selectedClip) return;
     const file = selectedClip.file;
@@ -865,6 +1119,35 @@ export default function Home() {
     const baseFile = clips[0]?.file;
     if (!baseFile) return;
 
+    const base = baseFile.name.replace(/\.mp4$/i, "");
+    const fileName = `${base || "video"}_sequence${fillGapsWithBlack ? "_gapfill" : ""}.mp4`;
+
+    // Get file handle immediately within user gesture context
+    const showSaveFilePicker = (window as unknown as { showSaveFilePicker?: unknown })
+      .showSaveFilePicker as
+      | undefined
+      | ((options: unknown) => Promise<{ createWritable: () => Promise<{ write: (chunk: unknown) => Promise<void>; close: () => Promise<void> }> }>);
+
+    let fileHandle: Awaited<ReturnType<NonNullable<typeof showSaveFilePicker>>> | null = null;
+    if (showSaveFilePicker) {
+      try {
+        fileHandle = await showSaveFilePicker({
+          suggestedName: fileName,
+          types: [
+            {
+              description: "MP4 video",
+              accept: { "video/mp4": [".mp4"] },
+            },
+          ],
+        });
+      } catch (e) {
+        // User cancelled the picker
+        if (e instanceof Error && e.name === "AbortError") return;
+        // Fall back to blob download
+        fileHandle = null;
+      }
+    }
+
     setIsExporting(true);
     setError(null);
     videoRef.current?.pause();
@@ -901,26 +1184,8 @@ export default function Home() {
         throw new Error(msg);
       }
 
-      const base = baseFile.name.replace(/\\.mp4$/i, "");
-      const fileName = `${base || "video"}_sequence${fillGapsWithBlack ? "_gapfill" : ""}.mp4`;
-
-      const showSaveFilePicker = (window as unknown as { showSaveFilePicker?: unknown })
-        .showSaveFilePicker as
-        | undefined
-        | ((options: unknown) => Promise<{ createWritable: () => Promise<{ write: (chunk: unknown) => Promise<void>; close: () => Promise<void> }> }>);
-
-      if (showSaveFilePicker && res.body) {
-        const handle = await showSaveFilePicker({
-          suggestedName: fileName,
-          types: [
-            {
-              description: "MP4 video",
-              accept: { "video/mp4": [".mp4"] },
-            },
-          ],
-        });
-
-        const writable = await handle.createWritable();
+      if (fileHandle && res.body) {
+        const writable = await fileHandle.createWritable();
         const reader = res.body.getReader();
         while (true) {
           const { done, value } = await reader.read();
@@ -968,15 +1233,15 @@ export default function Home() {
   return (
     <ToastProvider>
       <div className="min-h-screen bg-background text-foreground">
-        <div className="flex min-h-screen flex-col gap-6 px-6 py-8">
+        <div className="flex min-h-screen flex-col gap-4 px-6 py-8">
           {clips.length === 0 ? (
             <div className="fixed right-6 top-6 z-50">
               <ThemeToggle theme={theme} onChange={setTheme} />
             </div>
           ) : (
-            <header className="flex flex-wrap items-center justify-between gap-4">
-              <div className="min-w-0 flex items-center gap-6">
-                <div>
+            <header className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_380px]">
+              <div className="flex items-end justify-between gap-4">
+                <div className="min-w-0">
                   <div className="truncate font-semibold text-lg leading-tight">
                     {selectedClip?.file.name ?? "Untitled"}
                   </div>
@@ -996,7 +1261,7 @@ export default function Home() {
                 </div>
               </div>
 
-              <div className="flex items-center gap-3">
+              <div className="flex items-center justify-end gap-3 lg:pl-6">
                 <Button onClick={pickFile} size="sm" variant="outline">
                   <FolderOpenIcon className="size-4" />
                   Add clip
@@ -1315,13 +1580,27 @@ export default function Home() {
 
                     <TabsContent className="mt-4" value="copilot">
                       <div className="flex flex-col gap-3">
-                        <Textarea placeholder='Try: "Remove pauses", "Add jump cuts", "Zoom on speaker", "Add captions"...' />
-                        <Button disabled variant="secondary">
-                          Generate edit plan (coming soon)
-                        </Button>
-                        <div className="text-muted-foreground text-xs">
-                          Tip: we&apos;ll surface suggestions here and apply them to the timeline.
+                        <Textarea
+                          placeholder='Try: "Cut 0:10 to 0:20", "Trim to 0:05-1:00", "Crop to center (x=0.2,y=0.1,w=0.6,h=0.8)"...'
+                          value={copilotPrompt}
+                          onChange={(e) => setCopilotPrompt(e.target.value)}
+                        />
+                        <div className="flex gap-2">
+                          <Button
+                            className="flex-1"
+                            disabled={copilotBusy || !copilotPrompt.trim() || !selectedClip}
+                            onClick={runCopilot}
+                            variant="secondary"
+                          >
+                            {copilotBusy ? "Thinking…" : "Generate + apply edits"}
+                          </Button>
+                          <Button disabled={!canCopilotUndo} onClick={copilotUndo} variant="outline">
+                            Undo
+                          </Button>
                         </div>
+                        {copilotMessage && (
+                          <div className="text-muted-foreground text-xs">{copilotMessage}</div>
+                        )}
                       </div>
                     </TabsContent>
 
