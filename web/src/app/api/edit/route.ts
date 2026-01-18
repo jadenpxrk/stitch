@@ -1,6 +1,10 @@
 import fs from "node:fs/promises";
+import { createReadStream, createWriteStream } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import type { ReadableStream as NodeReadableStream } from "node:stream/web";
 import { NextResponse } from "next/server";
 import { CommandError, hasAudio, runFfmpeg, runFfprobe } from "@/lib/ffmpeg";
 
@@ -143,49 +147,111 @@ export async function POST(request: Request) {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "stitch-edit-"));
   const inputPath = path.join(tmpDir, "input.mp4");
   const outputPath = path.join(tmpDir, "output.mp4");
+  let cleanupOnStreamClose = false;
 
   try {
-    const buf = Buffer.from(await file.arrayBuffer());
-    await fs.writeFile(inputPath, buf);
+    await pipeline(
+      Readable.fromWeb(file.stream() as unknown as NodeReadableStream<Uint8Array>),
+      createWriteStream(inputPath),
+    );
 
     const dims = await getVideoDimensions(inputPath);
     const cropFilter = buildCropFilter(crop, dims);
 
     const audio = await hasAudio(inputPath);
-    const inputs: string[] = [
-      "-y",
-      "-ss",
-      trimStart.toFixed(3),
-      "-to",
-      trimEnd.toFixed(3),
-      "-i",
-      inputPath,
-    ];
+    const inputs: string[] = ["-y", "-ss", trimStart.toFixed(3), "-to", trimEnd.toFixed(3), "-i", inputPath];
 
-    if (!audio) {
-      inputs.push(
-        "-f",
-        "lavfi",
-        "-t",
-        duration.toFixed(3),
-        "-i",
-        "anullsrc=channel_layout=stereo:sample_rate=44100",
-      );
+    const wantCrop = Boolean(cropFilter);
+
+    // Fast-path: if no crop is requested, try to avoid re-encoding the video stream.
+    let usedFastPath = false;
+    if (!wantCrop) {
+      try {
+        if (audio) {
+          await runFfmpeg(
+            [
+              ...inputs,
+              "-map",
+              "0:v:0",
+              "-map",
+              "0:a:0",
+              "-c:v",
+              "copy",
+              "-c:a",
+              "copy",
+              "-avoid_negative_ts",
+              "make_zero",
+              "-movflags",
+              "+faststart",
+              outputPath,
+            ],
+            { timeoutMs: 10 * 60_000 },
+          );
+        } else {
+          await runFfmpeg(
+            [
+              ...inputs,
+              "-f",
+              "lavfi",
+              "-t",
+              duration.toFixed(3),
+              "-i",
+              "anullsrc=channel_layout=stereo:sample_rate=44100",
+              "-map",
+              "0:v:0",
+              "-map",
+              "1:a:0",
+              "-shortest",
+              "-c:v",
+              "copy",
+              "-c:a",
+              "aac",
+              "-ar",
+              "44100",
+              "-ac",
+              "2",
+              "-avoid_negative_ts",
+              "make_zero",
+              "-movflags",
+              "+faststart",
+              outputPath,
+            ],
+            { timeoutMs: 10 * 60_000 },
+          );
+        }
+        usedFastPath = true;
+      } catch {
+        // Fall through to the re-encode path for maximum compatibility.
+        await fs.rm(outputPath, { force: true }).catch(() => undefined);
+      }
     }
 
-    const outputArgs: string[] = [];
-    if (cropFilter) {
-      outputArgs.push("-vf", cropFilter);
-    }
+    // If output wasn't produced by the fast-path, re-encode (supports crop + accurate trim).
+    if (!usedFastPath) {
+      const inputsWithAudio = [...inputs];
+      if (!audio) {
+        inputsWithAudio.push(
+          "-f",
+          "lavfi",
+          "-t",
+          duration.toFixed(3),
+          "-i",
+          "anullsrc=channel_layout=stereo:sample_rate=44100",
+        );
+      }
 
-    if (audio) {
-      outputArgs.push(
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a:0",
+      const outputArgs: string[] = [];
+      if (cropFilter) {
+        outputArgs.push("-vf", cropFilter);
+      }
+
+      const commonEncode = [
         "-c:v",
         "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
         "-pix_fmt",
         "yuv420p",
         "-r",
@@ -199,36 +265,26 @@ export async function POST(request: Request) {
         "-movflags",
         "+faststart",
         outputPath,
-      );
-    } else {
-      outputArgs.push(
-        "-map",
-        "0:v:0",
-        "-map",
-        "1:a:0",
-        "-shortest",
-        "-c:v",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        "-r",
-        "30",
-        "-c:a",
-        "aac",
-        "-ar",
-        "44100",
-        "-ac",
-        "2",
-        "-movflags",
-        "+faststart",
-        outputPath,
-      );
+      ];
+
+      if (audio) {
+        outputArgs.push("-map", "0:v:0", "-map", "0:a:0", ...commonEncode);
+      } else {
+        outputArgs.push("-map", "0:v:0", "-map", "1:a:0", "-shortest", ...commonEncode);
+      }
+
+      await runFfmpeg([...inputsWithAudio, ...outputArgs], { timeoutMs: 10 * 60_000 });
     }
 
-    await runFfmpeg([...inputs, ...outputArgs], { timeoutMs: 10 * 60_000 });
+    const stream = createReadStream(outputPath);
+    const cleanup = async () => {
+      await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => undefined);
+    };
+    stream.on("close", () => void cleanup());
+    stream.on("error", () => void cleanup());
+    cleanupOnStreamClose = true;
 
-    const outBuf = await fs.readFile(outputPath);
-    return new NextResponse(outBuf, {
+    return new NextResponse(Readable.toWeb(stream) as unknown as ReadableStream<Uint8Array>, {
       headers: {
         "Content-Type": "video/mp4",
         "Content-Disposition": `attachment; filename="edited.mp4"`,
@@ -239,6 +295,8 @@ export async function POST(request: Request) {
     const message = err instanceof CommandError ? err.stderr || err.message : String(err);
     return NextResponse.json({ error: message }, { status: 500 });
   } finally {
-    await fs.rm(tmpDir, { recursive: true, force: true });
+    if (!cleanupOnStreamClose) {
+      await fs.rm(tmpDir, { recursive: true, force: true });
+    }
   }
 }
