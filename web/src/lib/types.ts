@@ -54,6 +54,7 @@ export interface SessionState {
   duration: number | null;
   source?: string;
   recordingUrl?: string | null;
+  recordingPath?: string | null;
   captions?: CaptionsState;
 }
 
