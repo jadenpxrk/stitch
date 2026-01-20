@@ -1335,7 +1335,7 @@ export default function Home() {
             </main>
           ) : (
             <div className="flex flex-1 flex-col gap-6 min-h-0">
-              <div className="grid flex-1 min-h-0 gap-6 lg:grid-cols-[minmax(0,1fr)_380px]">
+              <div className="grid flex-1 min-h-0 overflow-hidden gap-6 lg:grid-cols-[minmax(0,1fr)_380px]">
               <div className="min-h-0 space-y-10 overflow-y-auto">
                 <section className="space-y-3">
                   <div className="relative overflow-hidden rounded-xl bg-black">
@@ -1553,7 +1553,7 @@ export default function Home() {
                 </section>
               </div>
 
-              <aside className="min-h-0 overflow-hidden lg:pl-6 max-lg:pt-6 flex flex-col">
+              <aside className="min-h-0 max-h-[600px] overflow-hidden lg:pl-6 max-lg:pt-6 flex flex-col">
                 <div className="shrink-0">
                   <div className="font-semibold text-sm">Agents</div>
                   <div className="text-muted-foreground text-xs">
@@ -1616,7 +1616,7 @@ export default function Home() {
                       </div>
                     </TabsContent>
 
-                    <TabsContent className="mt-4" value="notes">
+                    <TabsContent className="mt-4" value="notes" keepMounted>
                       <CaptionsNotes file={selectedFile} />
                     </TabsContent>
                   </Tabs>

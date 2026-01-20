@@ -101,7 +101,7 @@ async function generateThumbnailLocal(inputJpg: string, outJpg: string) {
       "-i",
       inputJpg,
       "-vf",
-      "scale=1280:-2:force_original_aspect_ratio=decrease,eq=contrast=1.12:brightness=0.03:saturation=1.15,unsharp=5:5:0.8:5:5:0.0",
+      "scale=1280:-2:force_original_aspect_ratio=decrease,eq=contrast=1.12:brightness=0.03:saturation=1.15,unsharp=5:5:0.8:5:5:0.0,drawtext=text='GEMINI RATE LIMITED':fontsize=32:fontcolor=white:borderw=2:bordercolor=black:x=(w-text_w)/2:y=h-50",
       "-q:v",
       "2",
       outJpg,
@@ -203,7 +203,7 @@ async function runThumbnailViaGemini(inputJpg: string, outJpg: string) {
 
   const genAI = new GoogleGenerativeAI(geminiKey);
   const model = genAI.getGenerativeModel({
-    model: "gemini-2.0-flash-exp",
+    model: "gemini-2.5-flash-image",
     generationConfig: {
       // @ts-expect-error - responseModalities is a valid option for image generation
       responseModalities: ["image", "text"],
@@ -212,7 +212,7 @@ async function runThumbnailViaGemini(inputJpg: string, outJpg: string) {
 
   const prompt = readEnv(
     "GEMINI_THUMBNAIL_PROMPT",
-    "Transform this video frame into a professional, scroll-stopping YouTube thumbnail. Enhance colors and contrast, improve lighting, sharpen details, keep the main subject clear and centered, and make it feel high-quality. Keep it realistic. Do not add text, logos, or watermarks. Return only the enhanced image.",
+    "Transform this frame into a viral YouTube thumbnail. Make dramatic visual changes: pump up the saturation and vibrance significantly, add a subtle vignette, make colors pop like a professional thumbnail. The result should look noticeably more vibrant and eye-catching than the original. Return the edited image.",
   );
 
   const inputBuf = await fs.readFile(inputJpg);
@@ -419,7 +419,16 @@ export async function POST(request: Request) {
         try {
           usedProvider = await runThumbnailGeneration(outCandidate, outGenerated, provider);
         } catch (err) {
-          console.error(`Thumbnail generation (${provider}) failed; falling back to local.`, err);
+          const isRateLimit = err instanceof Error && (
+            err.message.includes("429") ||
+            err.message.includes("Too Many Requests") ||
+            err.message.includes("quota")
+          );
+          if (isRateLimit) {
+            console.error(`Thumbnail generation (${provider}) rate limited by Gemini; falling back to local.`);
+          } else {
+            console.error(`Thumbnail generation (${provider}) failed; falling back to local.`, err);
+          }
           usedProvider = false;
         }
         if (!usedProvider) {
